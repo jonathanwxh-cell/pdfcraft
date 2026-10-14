@@ -2648,14 +2648,17 @@ impl PdfCraftApp {
             self.set_full_screen(ctx, false);
         }
         if let Some(i) = self.active {
-            // Select all belongs to the document or page grid, unless a text field or
-            // overlay owns the keyboard. Other canvas shortcuts keep their own handling.
+            // Select all belongs to the document, the page grid or the Pages panel, unless a
+            // text field or overlay owns the keyboard. Other canvas shortcuts keep their own handling.
             if self.dialog.is_none()
                 && !self.palette_open
                 && !ctx.egui_wants_keyboard_input()
                 && ctx.input_mut(|input| input.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, Key::A)))
             {
-                if self.is_preparing() {
+                // Over the Pages panel it selects the pages, as in the organize grid (#2052).
+                if panels::pointer_over_pages(ctx) {
+                    self.views[i].select_all_pages();
+                } else if self.is_preparing() {
                     if let Some(doc) = self.session.get(self.views[i].id) {
                         prepare::select_all(&mut self.views[i], &doc.form);
                     }

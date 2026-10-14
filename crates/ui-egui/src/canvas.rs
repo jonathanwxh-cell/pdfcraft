@@ -1134,13 +1134,18 @@ impl DocView {
         true
     }
 
+    /// Select every page (the organize grid, or the Pages panel), keeping the current page as
+    /// the anchor for the next Shift-click.
+    pub fn select_all_pages(&mut self) -> bool {
+        self.selected = (0..self.page_count).collect();
+        self.select_anchor = (self.page_count > 0).then_some(self.current);
+        !self.selected.is_empty()
+    }
+
     /// Select all: every page in Organize, or every word on the current page.
     pub fn select_all(&mut self) -> bool {
         if self.organize {
-            self.selected = (0..self.page_count).collect();
-            // Keep the current page as the anchor for the next Shift-click.
-            self.select_anchor = (self.page_count > 0).then_some(self.current);
-            return !self.selected.is_empty();
+            return self.select_all_pages();
         }
         let page = self.current;
         let Some(t) = self.texts.get(&page) else { return false };

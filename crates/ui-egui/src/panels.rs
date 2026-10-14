@@ -998,11 +998,28 @@ fn outline_item(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, item: &OutlineIte
     }
 }
 
+fn pages_area_id() -> egui::Id {
+    egui::Id::new("pages-panel-area")
+}
+
+/// Whether the pointer is over the Pages panel as it was drawn last frame (or this one). ⌘/Ctrl+A
+/// there selects every page, as the panel's Escape and Delete act on its selection (#2052).
+pub(crate) fn pointer_over_pages(ctx: &egui::Context) -> bool {
+    let Some((area, frame)) = ctx.data(|d| d.get_temp::<(egui::Rect, u64)>(pages_area_id())) else { return false };
+    // A panel closed since then is not under the pointer.
+    ctx.cumulative_frame_nr().saturating_sub(frame) <= 1 && ctx.pointer_hover_pos().is_some_and(|p| area.contains(p))
+}
+
 /// The page thumbnails. A click goes to the page; ⌘/Ctrl-click and ⇧-click pick several pages
 /// (the selection page commands and Print act on) without moving the document. Right-click
 /// offers Extract, Cut, Copy and Paste on the selection, or on the page clicked; dragging
 /// moves the selection, or the page grabbed, to the gap it is dropped on.
 fn pages(ui: &mut egui::Ui, t: &Tokens, info: &DocInfo, view: &mut crate::DocView, modal: bool, editable: bool, nav: &mut Option<Nav>) {
+    // Where the panel is, for ⌘/Ctrl+A: shortcuts run before the panels are drawn, so they ask
+    // where the panel was last frame (see `pointer_over_pages`).
+    let frame = ui.ctx().cumulative_frame_nr();
+    let area = ui.clip_rect();
+    ui.ctx().data_mut(|d| d.insert_temp(pages_area_id(), (area, frame)));
     // Escape drops the selection while the pointer is over the panel and nothing else wants the key.
     if !modal
         && !view.selected.is_empty()

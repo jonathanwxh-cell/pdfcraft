@@ -3292,6 +3292,31 @@ fn pages_panel_escape_clears_and_deleted_pages_leave_the_selection() {
 }
 
 #[test]
+fn pages_panel_command_a_picks_every_page() {
+    // #2052: ⌘/Ctrl+A over the Pages panel picks every page, as in the organize grid, instead
+    // of selecting the current page's text.
+    let mut h = pages_panel(5);
+    h.get_by_label("Page 3").hover();
+    h.run_steps(2);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(2);
+    assert_eq!(picked(&h), [0, 1, 2, 3, 4]);
+    assert_eq!(h.state().views[0].current, 0, "picking pages does not turn the page");
+    assert_eq!(h.state().views[0].target_pages(), [0, 1, 2, 3, 4], "page commands act on all of them");
+    h.get_by_label_contains("5 pages selected");
+    // Escape, still over the panel, drops them again.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(picked(&h).is_empty());
+    // Over the document, ⌘/Ctrl+A is the page's Select All, as before: no pages are picked.
+    h.hover_at(egui::pos2(1000.0, 900.0));
+    h.run_steps(2);
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(2);
+    assert!(picked(&h).is_empty(), "{:?}", picked(&h));
+}
+
+#[test]
 fn print_shortcut_offers_the_pages_picked_in_the_pages_panel() {
     let mut h = pages_panel(5);
     h.get_by_label("Page 2").click_modifiers(Modifiers::NONE);

@@ -1978,3 +1978,105 @@ fn a_cross_reference_entry_that_misses_its_object_is_not_an_unchanged_object() {
     let s = signatures(&open(&honest), &honest, &trust).into_iter().find(|s| s.signed).unwrap();
     assert_eq!(s.status, Status::Valid, "{:?}", s.details);
 }
+
+/// `fixture()` with the page's resources in their own object (7) and a text field (8) that
+/// is also its widget.
+fn fixture_with_indirect_resources() -> Vec<u8> {
+    let objs: Vec<&[u8]> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 8 0 R] >> >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources 7 0 R /Annots [6 0 R 8 0 R] >>",
+        b"<< /Length 44 >>\nstream\nBT /F1 14 Tf 20 250 Td (Contract text) Tj ET\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Annot /Subtype /Widget /FT /Sig /T (Approval) /Rect [150 20 280 70] /P 3 0 R /F 4 >>",
+        b"<< /Font << /F1 5 0 R >> >>",
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /Rect [20 100 140 120] /P 3 0 R /F 4 >>",
+    ];
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    out
+}
+
+#[test]
+fn page_resources_that_gain_form_keys_are_not_form_filling() {
+    // #1787: the signed page and its content stream stay as they were, but its indirect
+    // /Resources now map /X1 to a new Form XObject that draws over the page, and pick up a key
+    // that marks a field, a form, a widget or a comment. What the dictionary is comes from the
+    // signed revision (page resources), so the change is never a permitted one.
+    type Marker = fn(&mut pdfcraft_cos::Dict);
+    let markers: [(&str, Marker); 7] = [
+        ("FT", |d| d.set(b"FT".to_vec(), Object::name("Tx"))),
+        ("DR", |d| d.set(b"DR".to_vec(), Object::Dict(pdfcraft_cos::Dict::new()))),
+        ("T and Kids", |d| {
+            d.set(b"T".to_vec(), PdfString::literal("x"));
+            d.set(b"Kids".to_vec(), Object::Array(vec![]));
+        }),
+        ("Subtype Widget", |d| d.set(b"Subtype".to_vec(), Object::name("Widget"))),
+        ("Annot with Rect", |d| {
+            d.set(b"Type".to_vec(), Object::name("Annot"));
+            d.set(b"Subtype".to_vec(), Object::name("Square"));
+            d.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(1), Object::Int(1)]));
+        }),
+        ("Fields", |d| d.set(b"Fields".to_vec(), Object::Array(vec![]))),
+        ("Subtype Link", |d| d.set(b"Subtype".to_vec(), Object::name("Link"))),
+    ];
+    for (name, mark) in markers {
+        eprintln!("marker: {name}");
+        assert_refused_at_every_level(&fixture_with_indirect_resources(), "other changes", |doc| {
+            let mut form = pdfcraft_cos::Dict::new();
+            form.set(b"Type".to_vec(), Object::name("XObject"));
+            form.set(b"Subtype".to_vec(), Object::name("Form"));
+            form.set(b"BBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(300), Object::Int(300)]));
+            let body = b"1 g 0 240 300 30 re f 0 g BT /F1 14 Tf 20 250 Td (Amount due: 999999 EUR) Tj ET".to_vec();
+            form.set(b"Length".to_vec(), Object::Int(body.len() as i64));
+            let forged = doc.add(Object::Stream(pdfcraft_cos::Stream::from_raw(form, body)));
+            doc.update_dict(pdfcraft_cos::ObjRef { num: 7, generation: 0 }, |d| {
+                d.set(b"XObject".to_vec(), Object::Dict(dict_of(vec![("X1", Object::Ref(forged))])));
+                mark(d);
+            })
+            .unwrap();
+        });
+    }
+
+    // Control: filling the real text field (its value and a new appearance) is still permitted
+    // form filling for approval signatures and certification levels 2 and 3, and refused at 1.
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    for certify in LEVELS {
+        let signed = pdfcraft_sign::sign(&open(&fixture_with_indirect_resources()), &id, &SignOptions { certify, ..opts() }).unwrap();
+        let filled = edit_after(&signed, |doc| {
+            let mut ap = pdfcraft_cos::Dict::new();
+            ap.set(b"Type".to_vec(), Object::name("XObject"));
+            ap.set(b"Subtype".to_vec(), Object::name("Form"));
+            ap.set(b"BBox".to_vec(), Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(120), Object::Int(20)]));
+            ap.set(b"Resources".to_vec(), Object::Dict(dict_of(vec![("Font", Object::Dict(dict_of(vec![("F1", oref(5))])))])));
+            let body = b"/Tx BMC BT /F1 12 Tf 2 5 Td (Alice) Tj ET EMC".to_vec();
+            ap.set(b"Length".to_vec(), Object::Int(body.len() as i64));
+            let ap = doc.add(Object::Stream(pdfcraft_cos::Stream::from_raw(ap, body)));
+            doc.update_dict(pdfcraft_cos::ObjRef { num: 8, generation: 0 }, |d| {
+                d.set(b"V".to_vec(), PdfString::literal("Alice"));
+                d.set(b"AP".to_vec(), Object::Dict(dict_of(vec![("N", Object::Ref(ap))])));
+            })
+            .unwrap();
+        });
+        let s = signatures(&open(&filled), &filled, &trust).into_iter().find(|s| s.signed).unwrap();
+        if certify == Some(1) {
+            assert_eq!(s.status, Status::Invalid, "{certify:?}: {:?}", s.modification);
+        } else {
+            assert_eq!(s.status, Status::Valid, "{certify:?}: {:?} {:?}", s.modification, s.details);
+            assert_eq!(s.modification, Modification::Allowed(vec![kind::FORM_FILL]), "{certify:?}");
+        }
+    }
+}

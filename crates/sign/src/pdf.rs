@@ -1539,19 +1539,24 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) 
         Some(b"Pages") => return if before.is_some() { kind::PAGES } else { kind::STRUCTURE },
         _ => {}
     }
-    match d.name(b"Subtype") {
+    // What an object that existed when signed is (a widget, a comment, a field, a form) is read
+    // from its signed version: keys the new version adds don't make it one. Otherwise a rewritten
+    // page resource dictionary that gains /FT, /DR, /T and /Kids, /Subtype /Widget, /Rect or
+    // /Fields would pass as form filling or comments while the page shows something else (#1787).
+    let role = before.unwrap_or(d);
+    match role.name(b"Subtype") {
         Some(b"Widget") => return if d.name(b"FT") == Some(b"Sig") && signature_ok { kind::SIGNATURE } else { kind::FORM_FILL },
         Some(b"Link") => return kind::LINKS,
-        Some(_) if ty == Some(b"Annot") || d.contains(b"Rect") => return kind::COMMENTS,
+        Some(_) if role.name(b"Type") == Some(b"Annot") || role.contains(b"Rect") => return kind::COMMENTS,
         _ => {}
     }
     if d.name(b"FT") == Some(b"Sig") && signature_ok {
         return kind::SIGNATURE;
     }
-    if d.contains(b"Fields") {
+    if role.contains(b"Fields") {
         return acroform_kind(doc, old, d, before);
     }
-    if d.contains(b"FT") || (d.contains(b"T") && d.contains(b"Kids")) || d.contains(b"DR") {
+    if role.contains(b"FT") || (role.contains(b"T") && role.contains(b"Kids")) || role.contains(b"DR") {
         return kind::FORM_FILL;
     }
     if before.is_none() {

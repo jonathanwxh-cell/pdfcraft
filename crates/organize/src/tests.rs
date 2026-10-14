@@ -622,11 +622,6 @@ fn links_are_rewired_to_copied_pages_or_dropped() {
     assert!(!link.contains(b"Dest") && !link.contains(b"A"));
 }
 
-/// A widget annotation that is its own form field (no `/Parent`).
-fn own_field(doc: &Document, r: ObjRef) -> bool {
-    doc.get(r).as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Widget") && !d.contains(b"Parent"))
-}
-
 #[test]
 fn repeated_page_gets_independent_annotations() {
     // A1 has a link, A2 a link and a form field, A3 a note with a popup; each is listed twice.
@@ -640,15 +635,13 @@ fn repeated_page_gets_independent_annotations() {
         assert!(!refs[i].is_empty());
         assert_eq!(refs[i].len(), refs[i + 1].len());
         for (a, b) in refs[i].iter().zip(&refs[i + 1]) {
-            // A widget that is its own field stays one object on both pages, so the field stays
-            // one (#790); every other annotation is copied.
-            if !own_field(&out, *a) {
-                assert_ne!(a, b, "each copy of the page has its own annotation objects");
-            }
+            // Widgets too: a field's widget on each copy is a widget of its own, of one field
+            // (#790, #1810).
+            assert_ne!(a, b, "each copy of the page has its own annotation objects");
         }
     }
     for (i, list) in refs.iter().enumerate() {
-        for a in list.iter().filter(|a| !own_field(&out, **a)) {
+        for a in list {
             assert_eq!(out.get(*a).as_dict().unwrap().reference(b"P"), Some(ps[i].obj), "/P names the page holding the copy");
         }
     }
@@ -2080,6 +2073,53 @@ fn a_repeated_widget_joins_an_indirect_kids_array() {
     assert_eq!(kids.len(), 3, "both original widgets and the repeat's own: {kids:?}");
 }
 
+/// #1810: a page listed twice whose widget is its own field. The field stays one (one name, one
+/// value, one /AcroForm entry), but each page gets its own widget, whose /P is that page.
+#[test]
+fn a_repeated_page_splits_a_widget_that_is_its_own_field() {
+    let b: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [5 0 R] >> >>".into(), // 1
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>".into(), // 2
+        "<< /Type /Page /Parent 2 0 R /Annots [5 0 R] >>".into(),                   // 3
+        "<< /Title (form) >>".into(),                                               // 4
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (Ada) /DA (/Helv 0 Tf 0 g) /Ff 2 \
+           /Rect [60 60 200 80] /P 3 0 R /F 4 /MK << /BG [1] >> \
+           /AA << /K << /S /JavaScript /JS (1) >> /E << /S /JavaScript /JS (2) >> >> >>"
+            .into(), // 5
+    ];
+    let src = open(build(&b, "/Root 1 0 R /Info 4 0 R"));
+    let out = full_roundtrip(&extract_pages(&src, &[0, 0, 0]).unwrap());
+    let ps = pages(&out).unwrap();
+    let widgets: Vec<ObjRef> =
+        (0..3).map(|i| page_dict(&out, i).get(b"Annots").and_then(|a| out.resolve(a).as_array().cloned()).unwrap()[0].as_ref().unwrap()).collect();
+    assert!(widgets[0] != widgets[1] && widgets[1] != widgets[2] && widgets[0] != widgets[2], "{widgets:?}");
+    let fields = out.resolve(catalog(&out).get(b"AcroForm").unwrap()).as_dict().unwrap().get(b"Fields").and_then(Object::as_array).cloned().unwrap();
+    assert_eq!(fields.len(), 1, "still one field");
+    let field_ref = fields[0].as_ref().unwrap();
+    let field = out.get(field_ref).as_dict().cloned().unwrap();
+    assert_eq!(field.get(b"V").and_then(Object::as_string).map(|s| s.to_text()).as_deref(), Some("Ada"));
+    assert_eq!(field.name(b"FT"), Some(&b"Tx"[..]));
+    assert!(field.contains(b"DA") && field.contains(b"Ff"), "field entries stay on the field");
+    assert!(!field.contains(b"Rect") && !field.contains(b"Subtype") && !field.contains(b"MK"), "widget entries move to the widgets");
+    let kids: Vec<ObjRef> = field.get(b"Kids").and_then(Object::as_array).unwrap().iter().filter_map(Object::as_ref).collect();
+    assert_eq!(kids, widgets, "the field's widgets, in page order");
+    let aa = |d: &pdfcraft_cos::Dict| d.get(b"AA").map(|a| out.resolve(a).as_dict().cloned().unwrap()).unwrap_or_default();
+    assert!(aa(&field).contains(b"K") && !aa(&field).contains(b"E"), "keystroke stays a field action");
+    for (i, w) in widgets.iter().enumerate() {
+        let w = out.get(*w).as_dict().cloned().unwrap();
+        assert_eq!(w.reference(b"P"), Some(ps[i].obj), "page {i}: /P names the page that lists it");
+        assert_eq!(w.reference(b"Parent"), Some(field_ref));
+        assert_eq!(w.name(b"Subtype"), Some(&b"Widget"[..]));
+        assert!(w.contains(b"Rect") && w.contains(b"MK") && !w.contains(b"V") && !w.contains(b"T"));
+        assert!(aa(&w).contains(b"E") && !aa(&w).contains(b"K"), "mouse-enter stays a widget action");
+    }
+    // Listed once, a widget that is its own field is copied as it is.
+    let once = full_roundtrip(&extract_pages(&src, &[0]).unwrap());
+    let w = page_dict(&once, 0).get(b"Annots").and_then(|a| once.resolve(a).as_array().cloned()).unwrap()[0].as_ref().unwrap();
+    let w = once.get(w).as_dict().cloned().unwrap();
+    assert!(w.contains(b"FT") && w.contains(b"Rect") && !w.contains(b"Kids"));
+}
+
 /// A one-page document whose form holds one text field named `name` (a widget that is its own
 /// field, the smallest form a page can carry).
 fn doc_with_field(name: &str) -> Document {
@@ -2388,11 +2428,15 @@ fn a_repeated_page_joins_the_renamed_field() {
         .map(|l| dst.resolve(l))
         .and_then(|l| l.as_array().cloned())
         .unwrap();
-    let renamed = fields[1].clone();
+    let renamed = fields[1].as_ref().unwrap();
+    let mut widgets = Vec::new();
     for page in [1, 2] {
         let list = page_dict(&dst, page).get(b"Annots").map(|a| dst.resolve(a)).and_then(|a| a.as_array().cloned()).unwrap();
-        assert!(list.contains(&renamed), "page {page}'s widget belongs to the renamed field");
+        let widget = list[0].as_ref().unwrap();
+        assert_eq!(dst.get(widget).as_dict().unwrap().reference(b"Parent"), Some(renamed), "page {page}'s widget belongs to the renamed field");
+        widgets.push(widget);
     }
+    assert_ne!(widgets[0], widgets[1], "each page has its own widget (#1810)");
 }
 
 /// Combining forms keeps same-named fields separate — the second file's colliding field is

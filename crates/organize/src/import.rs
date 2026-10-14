@@ -283,6 +283,8 @@ fn import_pages_mapped(
         })
         .collect();
     let mut annot_pages = HashMap::new();
+    // Widgets that are their own field, with each page that lists their copy (see below).
+    let mut own_fields: Vec<(ObjRef, ObjRef)> = Vec::new();
     let mut new_pages = Vec::new();
     let mut done: HashMap<ObjRef, ObjRef> = HashMap::new();
     for (page, new, inherited) in targets {
@@ -357,6 +359,9 @@ fn import_pages_mapped(
                         }
                         _ => continue,
                     };
+                    if own_field {
+                        own_fields.push((r, new));
+                    }
                     annot_pages.insert(r, new);
                     out.push(Object::Ref(r));
                 }
@@ -389,6 +394,20 @@ fn import_pages_mapped(
         done.insert(page, new);
         new_pages.push(new);
     }
+    // A widget that is its own field and now shows on several pages becomes a field with one
+    // widget per page: one field and one value, but each page's widget has its own /P and place,
+    // so it can be moved or deleted on that page alone (#1810).
+    let mut seen: Vec<ObjRef> = Vec::new();
+    for &(field, _) in &own_fields {
+        if seen.contains(&field) {
+            continue;
+        }
+        seen.push(field);
+        let on: Vec<ObjRef> = own_fields.iter().filter(|(f, _)| *f == field).map(|(_, p)| *p).collect();
+        if on.len() > 1 {
+            split_shared_widget(dst, field, &on, &mut annot_pages, &mut copier.annots)?;
+        }
+    }
     copier.fix_annotations(dst, &annot_pages)?;
     let renamed_fields = match conflicts {
         FieldConflicts::Rename => resolve_field_conflicts(dst, &copier.fields)?,
@@ -401,6 +420,99 @@ fn import_pages_mapped(
     existing.splice(at..at, inserted);
     rebuild(dst, &existing)?;
     Ok(Imported { pages: new_pages, page_map: copier.pages, objects: copier.map, renamed_fields })
+}
+
+/// Entries of a merged field and widget dictionary that belong to the widget annotation
+/// (ISO 32000-2 Tables 166 and 191); the rest (`/FT`, `/T`, `/V`, `/DA`, `/Ff`…) are the field's.
+const WIDGET_KEYS: &[&[u8]] = &[
+    b"Type",
+    b"Subtype",
+    b"Rect",
+    b"Contents",
+    b"P",
+    b"NM",
+    b"M",
+    b"F",
+    b"AP",
+    b"AS",
+    b"Border",
+    b"C",
+    b"StructParent",
+    b"OC",
+    b"AF",
+    b"ca",
+    b"CA",
+    b"BM",
+    b"Lang",
+    b"H",
+    b"MK",
+    b"A",
+    b"BS",
+];
+
+/// Additional-actions triggers of a field (Table 199); the others (`/E`, `/X`, `/D`, `/U`, `/Fo`,
+/// `/Bl`, `/PO`…) are the widget annotation's (Table 197).
+const FIELD_TRIGGERS: &[&[u8]] = &[b"K", b"F", b"V", b"C"];
+
+/// Turn `field`, a widget that is its own field and is listed on each page of `pages` (in order,
+/// a page once per listing), into a field whose kids are one widget per listing. The field keeps
+/// its object number, so `/AcroForm /Fields` and anything else naming it still finds it; each
+/// page lists its own widget in its place.
+fn split_shared_widget(
+    dst: &mut Document,
+    field: ObjRef,
+    pages: &[ObjRef],
+    annot_pages: &mut HashMap<ObjRef, ObjRef>,
+    annots: &mut Vec<ObjRef>,
+) -> Result<(), OrganizeError> {
+    let Some(merged) = dst.get(field).as_dict().cloned() else { return Ok(()) };
+    // Already a field with kids, or a widget that names no field: leave it as it was.
+    if merged.contains(b"Kids") || !(merged.contains(b"FT") || merged.contains(b"T")) {
+        return Ok(());
+    }
+    let mut parent = Dict::new();
+    let mut widget = Dict::new();
+    for (k, v) in merged.iter() {
+        if k.as_slice() == b"AA" {
+            let aa = dst.resolve(v).as_dict().cloned().unwrap_or_default();
+            let (mut mine, mut theirs) = (Dict::new(), Dict::new());
+            for (t, a) in aa.iter() {
+                if FIELD_TRIGGERS.contains(&t.as_slice()) { mine.set(t.clone(), a.clone()) } else { theirs.set(t.clone(), a.clone()) }
+            }
+            if !mine.is_empty() {
+                parent.set(b"AA".to_vec(), Object::Dict(mine));
+            }
+            if !theirs.is_empty() {
+                widget.set(b"AA".to_vec(), Object::Dict(theirs));
+            }
+        } else if WIDGET_KEYS.contains(&k.as_slice()) {
+            widget.set(k.clone(), v.clone());
+        } else {
+            parent.set(k.clone(), v.clone());
+        }
+    }
+    widget.set(b"Parent".to_vec(), Object::Ref(field));
+    let mut kids = Vec::with_capacity(pages.len());
+    for &page in pages {
+        let r = dst.add(Object::Dict(widget.clone()));
+        // This listing of the field on `page` (an earlier listing on the same page took an
+        // earlier widget) is now the widget.
+        dst.update_dict(page, |d| {
+            if let Some(Object::Array(list)) = d.get_mut(b"Annots")
+                && let Some(slot) = list.iter_mut().find(|o| o.as_ref() == Some(field))
+            {
+                *slot = Object::Ref(r);
+            }
+        })?;
+        annot_pages.insert(r, page);
+        annots.push(r);
+        kids.push(Object::Ref(r));
+    }
+    annot_pages.remove(&field);
+    annots.retain(|a| *a != field);
+    parent.set(b"Kids".to_vec(), Object::Array(kids));
+    dst.set(field, Object::Dict(parent));
+    Ok(())
 }
 
 /// A page's `/Resources` with the names that only its page-tree ancestors list, or `None` when

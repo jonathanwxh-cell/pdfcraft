@@ -4228,6 +4228,9 @@ fn image_pixels_follow_the_frame_while_a_corner_is_dragged() {
     let start = frame(&h).expect("the selected image has a frame");
     let (grip, fixed) = (start.right_top(), start.left_bottom());
     for factor in [0.6, 1.3] {
+        // The drag samples the asynchronously rendered page raster. UI frame counts do not
+        // guarantee it has arrived; undo also requests a fresh render before the next drag.
+        support::wait_until(&mut h, "page raster before image resize", |app| !app.render_pending());
         let to = fixed + (grip - fixed) * factor;
         h.hover_at(grip);
         h.run_steps(1);

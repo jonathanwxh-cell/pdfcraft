@@ -1,5 +1,7 @@
 # PdfCraft roadmap: milestones and what's next
 
+> **2026-10-23 review follow-up (#3820, M7):** normalize signed TJ tracking and preserve the original pen position after replacing a final cell. Synthetic regressions reproduce both prior failures and cover genuine column gaps, all Tf/Tz sign combinations, nonempty suffixes and line/block edits after save/reopen. Scope and estimates unchanged.
+
 > **Last reviewed:** 2026-10-22 · **Last updated:** 2026-10-22 · **Change:** patch (M7, PR #3820 review: checked `TJ` operand ranges and malformed-input coverage; scope and estimates unchanged)
 
 > **Last reviewed:** 2026-10-20 · **Last updated:** 2026-10-20 · **Change:** minor (M12 #3673: Character encoding accepts Identity-H/V with Adobe CJK collections; estimates unchanged)

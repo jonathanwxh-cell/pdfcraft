@@ -922,7 +922,7 @@ fn tj_tracking(pieces: &[Object], metrics: &Metrics, size: f64, scale: f64) -> f
             for (code, len) in metrics.codes(&s.bytes) {
                 let blank = metrics.is_space(code, len) || metrics.text_of(code).is_some_and(|t| !t.is_empty() && t.chars().all(char::is_whitespace));
                 if previous && !blank {
-                    gaps.push(gap);
+                    gaps.push(gap * (size * scale).signum());
                 }
                 previous = !blank;
                 gap = 0.0;
@@ -931,7 +931,7 @@ fn tj_tracking(pieces: &[Object], metrics: &Metrics, size: f64, scale: f64) -> f
             gap += -n / 1000.0 * size * scale;
         }
     }
-    typical_tracking(&mut gaps, size * scale.abs() * 0.5)
+    typical_tracking(&mut gaps, (size * scale).abs() * 0.5)
 }
 
 /// Horizontal advance of a single encoded glyph in text space (`((w0 * Tfs + Tc + Tw) * Th)`).
@@ -2556,11 +2556,13 @@ pub(crate) fn replace_line_with_limit(doc: &mut Document, page: usize, line: usi
             wrapped.push(Op::new("TJ", vec![Object::Array(prefix)]));
         }
         wrapped.append(&mut replacement);
+        // Restore the original pen advance even for the final cell: later shows in
+        // this text object can be positioned relative to it without resetting Tm.
+        let delta = target_slice.adjustment - new_adj;
+        if delta.is_finite() && delta != 0.0 {
+            suffix.insert(0, pdfcraft_content::num(delta));
+        }
         if !suffix.is_empty() {
-            let delta = target_slice.adjustment - new_adj;
-            if delta.is_finite() && delta != 0.0 {
-                suffix.insert(0, pdfcraft_content::num(delta));
-            }
             wrapped.push(Op::new("TJ", vec![Object::Array(suffix)]));
         }
         replacement = wrapped;

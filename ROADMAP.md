@@ -1,5 +1,7 @@
 # PdfCraft roadmap
 
+> **2026-10-23 review follow-up (#3820, M7):** normalize signed TJ tracking and preserve the original pen position after replacing a final cell. Synthetic regressions reproduce both prior failures and cover genuine column gaps, all Tf/Tz sign combinations, nonempty suffixes and line/block edits after save/reopen. Scope and estimates unchanged.
+
 > **2026-10-23 review candidate (#3820, M8):** retain individual TJ-cell audit geometry without losing combined gap-cover detections. 34 audit tests, strict no-dependency Clippy, wasm, formatting, layering and asset gates pass; the prior implementation fails the new 45%-cell regression. Dependency-inclusive Clippy remains blocked by an unchanged edit/images.rs lint. Estimates unchanged.
 
 **Stage: alpha** · next: beta, ~25% (ready for real work 50% → 75%) and ~400–700 h away

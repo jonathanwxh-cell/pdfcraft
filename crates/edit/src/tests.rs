@@ -5864,6 +5864,52 @@ fn a_clipping_copy_on_the_same_baseline_is_refused() {
     assert_eq!(text::text_lines(&doc, 0).unwrap().len(), 2, "refused means untouched");
 }
 
+#[test]
+fn tj_tracking_respects_signed_text_direction() {
+    for (size, scale) in [(10, 100), (10, -100), (-10, 100), (-10, -100)] {
+        for (jump, count) in [(3100, 1), (3300, 2)] {
+            let doc = text_page(&format!("BT /F1 {size} Tf {scale} Tz 1 0 0 1 300 700 Tm [(A) -200 (B) -200 (C) -200 (D) -{jump} (E)] TJ ET"));
+            let lines = text::text_lines(&doc, 0).unwrap();
+            assert_eq!(lines.len(), count, "size={size} scale={scale} jump={jump}: {lines:?}");
+        }
+    }
+}
+
+#[test]
+fn replacing_final_tj_cell_preserves_following_show_position() {
+    for (size, scale) in [(12, 100), (12, -100), (-12, 100), (-12, -100)] {
+        for suffix in ["", " 0", " -500"] {
+            let original = text_page(&format!(
+                "BT /F1 {size} Tf {scale} Tz 0.4 Tc 0.8 Tw 1 0 0 1 300 700 Tm [(Left) -8000 (Right Cell){suffix}] TJ [-8000] TJ (Tail) Tj [-8000 (Last)] TJ ET"
+            ));
+            let before = text::text_lines(&original, 0).unwrap();
+            let target = before.iter().position(|l| l.text == "Right Cell").unwrap();
+            for replacement in ["X", "Much Longer Cell", "Right Cell"] {
+                for by_block in [false, true] {
+                    let mut doc = original.clone();
+                    if by_block {
+                        text::replace_block(&mut doc, 0, target, replacement).unwrap();
+                    } else {
+                        text::replace_line(&mut doc, 0, target, replacement).unwrap();
+                    }
+                    let after = text::text_lines(&reopen(&doc), 0).unwrap();
+                    assert!(after.iter().any(|l| l.text == replacement), "replacement missing: {after:?}");
+                    for label in ["Left", "Tail", "Last"] {
+                        let old = before.iter().find(|l| l.text == label).unwrap();
+                        let kept = after.iter().find(|l| l.text == label).unwrap();
+                        assert!(
+                            close(kept.rect, old.rect),
+                            "size={size} scale={scale} suffix={suffix:?} block={by_block} replacement={replacement} {label}: {:?} != {:?}",
+                            kept.rect,
+                            old.rect
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// #3744: QuickBooks and Microsoft Print to PDF write an entire invoice table row as one `TJ`
 /// array with multi-em negative adjustments between columns. Each cell must be its own line and
 /// paragraph, and editing, previewing, or moving one cell must leave the other columns in place.

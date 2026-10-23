@@ -452,6 +452,76 @@ fn combs(boxes: &[[f64; 4]]) -> Vec<([f64; 4], usize)> {
     out
 }
 
+/// A balanced bounding-volume tree indexes *all* existing widgets, independently of the
+/// proposal/label budget. Far-away widgets can be excluded together instead of rescanning
+/// the entire page for each proposal. Construction is O(n log n), with logarithmic depth.
+struct WidgetIndex {
+    bounds: [f64; 4],
+    contents: WidgetContents,
+}
+
+enum WidgetContents {
+    Leaf(Box<[[f64; 4]]>),
+    Branch(Box<WidgetIndex>, Box<WidgetIndex>),
+}
+
+fn rectangles_overlap(a: [f64; 4], b: [f64; 4]) -> bool {
+    #[cfg(test)]
+    work_bound_tests::record_comparison();
+    a[0] < b[2] - 1.0 && b[0] < a[2] - 1.0 && a[1] < b[3] - 1.0 && b[1] < a[3] - 1.0
+}
+
+impl WidgetIndex {
+    fn new(rects: &[[f64; 4]]) -> Option<Self> {
+        // A NaN makes the exact overlap predicate false. Infinities and inverted boxes are
+        // retained: pruning uses normalized bounds, but leaves preserve original geometry.
+        let mut rects: Vec<_> = rects.iter().copied().filter(|r| !r.iter().any(|x| x.is_nan())).collect();
+        Self::build(&mut rects, 0)
+    }
+
+    fn build(rects: &mut [[f64; 4]], depth: usize) -> Option<Self> {
+        let first = rects.first()?;
+        let mut bounds = [first[0].min(first[2]), first[1].min(first[3]), first[0].max(first[2]), first[1].max(first[3])];
+        for r in rects.iter().skip(1) {
+            bounds = [bounds[0].min(r[0]).min(r[2]), bounds[1].min(r[1]).min(r[3]), bounds[2].max(r[0]).max(r[2]), bounds[3].max(r[1]).max(r[3])];
+        }
+        let contents = if rects.len() <= 8 {
+            WidgetContents::Leaf(rects.to_vec().into_boxed_slice())
+        } else {
+            let axis = depth % 2;
+            let mid = rects.len() / 2;
+            rects.select_nth_unstable_by(mid, |a, b| a[axis].total_cmp(&b[axis]));
+            let (left, right) = rects.split_at_mut(mid);
+            WidgetContents::Branch(Box::new(Self::build(left, depth + 1)?), Box::new(Self::build(right, depth + 1)?))
+        };
+        Some(Self { bounds, contents })
+    }
+
+    fn overlaps(&self, rect: [f64; 4], remaining: &mut usize) -> bool {
+        // Spatial indexes can degenerate on adversarial geometry. Exhaustion suppresses
+        // the unverified proposal, rather than overlooking any existing widget exclusion.
+        if *remaining == 0 {
+            return true;
+        }
+        *remaining -= 1;
+        #[cfg(test)]
+        work_bound_tests::record_index_visit();
+        if !rectangles_overlap(self.bounds, rect) {
+            return false;
+        }
+        match &self.contents {
+            WidgetContents::Leaf(rects) => rects.iter().any(|r| {
+                if *remaining == 0 {
+                    return true;
+                }
+                *remaining -= 1;
+                rectangles_overlap(*r, rect)
+            }),
+            WidgetContents::Branch(left, right) => left.overlaps(rect, remaining) || right.overlaps(rect, remaining),
+        }
+    }
+}
+
 /// Propose fields for a page. `existing` are the page's widget rectangles (no candidate
 /// overlaps them); names are unique against `taken`.
 ///
@@ -466,13 +536,11 @@ pub fn detect(words: &[Word], shapes: &Shapes, existing: &[[f64; 4]], taken: &[S
     // check-box loop would still leave quadratic work on all of a hostile page's rectangles.
     let boxes = shapes.boxes.get(..shapes.boxes.len().min(MAX_DETECTION_BOXES)).unwrap_or_default();
     let mut out: Vec<Candidate> = Vec::new();
-    let overlaps = |a: [f64; 4], b: [f64; 4]| {
-        #[cfg(test)]
-        work_bound_tests::record_comparison();
-        a[0] < b[2] - 1.0 && b[0] < a[2] - 1.0 && a[1] < b[3] - 1.0 && b[1] < a[3] - 1.0
-    };
-    let push = |kind: Kind, rect: [f64; 4], label: String, out: &mut Vec<Candidate>| {
-        if existing.iter().chain(out.iter().map(|c| &c.rect)).any(|e| overlaps(*e, rect)) {
+    let overlaps = rectangles_overlap;
+    let existing_index = WidgetIndex::new(existing);
+    let mut existing_work = 64 * MAX_DETECTION_BOXES;
+    let mut push = |kind: Kind, rect: [f64; 4], label: String, out: &mut Vec<Candidate>| {
+        if existing_index.as_ref().is_some_and(|index| index.overlaps(rect, &mut existing_work)) || out.iter().any(|c| overlaps(c.rect, rect)) {
             return;
         }
         out.push(Candidate { kind, rect, name: label });
@@ -574,10 +642,15 @@ mod work_bound_tests {
     // wall time: appending more hostile rectangles must not add pairwise comparisons.
     thread_local! {
         static COMPARISONS: Cell<usize> = const { Cell::new(0) };
+        static INDEX_VISITS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn record_comparison() {
         COMPARISONS.set(COMPARISONS.get() + 1);
+    }
+
+    pub(super) fn record_index_visit() {
+        INDEX_VISITS.set(INDEX_VISITS.get() + 1);
     }
 
     #[test]
@@ -601,8 +674,86 @@ mod work_bound_tests {
                 shapes.boxes.extend_from_within(..);
                 COMPARISONS.set(0);
                 assert_eq!(run(&shapes), expected);
-                assert_eq!(COMPARISONS.get(), bounded, "discarded inputs add no pairwise work");
+                if existing_only {
+                    // Existing widgets are never discarded: doubling them may add tree levels,
+                    // but must not restore the full pairwise scan.
+                    assert!(COMPARISONS.get() <= bounded + 16 * MAX_DETECTION_BOXES);
+                } else {
+                    assert_eq!(COMPARISONS.get(), bounded, "discarded inputs add no pairwise work");
+                }
             }
         }
+    }
+
+    #[test]
+    fn many_existing_widgets_do_not_multiply_proposal_work() {
+        let mut existing: Vec<_> = (0..100_000)
+            .map(|i| {
+                let x = i as f64 * 30.0;
+                [x, 100.0, x + 10.0, 110.0]
+            })
+            .collect();
+        let shapes = Shapes {
+            boxes: (0..MAX_DETECTION_BOXES)
+                .map(|i| {
+                    let x = i as f64 * 30.0;
+                    [x, 0.0, x + 10.0, 10.0]
+                })
+                .collect(),
+            rules: Vec::new(),
+        };
+        // An exclusion beyond both budgets must still suppress the last drawn candidate.
+        let exclusion = [59_970.0, 0.0, 59_980.0, 10.0];
+        existing.push(exclusion);
+        COMPARISONS.set(0);
+        let expected = detect(&[], &shapes, &[exclusion], &[]);
+        let baseline_work = COMPARISONS.get();
+        COMPARISONS.set(0);
+        INDEX_VISITS.set(0);
+        let candidates = detect(&[], &shapes, &existing, &[]);
+        assert_eq!(candidates.len(), MAX_DETECTION_BOXES - 1);
+        assert_eq!(candidates, expected);
+        assert!(!candidates.iter().any(|c| c.rect == [59_970.0, 0.0, 59_980.0, 10.0]));
+        assert!(COMPARISONS.get() <= baseline_work + 64 * MAX_DETECTION_BOXES, "existing-widget comparisons must not be candidates times widgets");
+        assert!(INDEX_VISITS.get() < 100 * MAX_DETECTION_BOXES);
+    }
+
+    #[test]
+    fn widget_index_matches_linear_overlap_semantics() {
+        let mut rects =
+            vec![[0.0, 0.0, 10.0, 10.0], [30.0, 20.0, 20.0, 10.0], [f64::NEG_INFINITY, 50.0, f64::INFINITY, 60.0], [f64::NAN, 0.0, 10.0, 10.0]];
+        rects.extend((0..500).map(|i| {
+            let x = (i % 25) as f64 * 3.0;
+            let y = (i / 25) as f64 * 4.0;
+            [x, y, x + 2.0, y + 2.0]
+        }));
+        let index = WidgetIndex::new(&rects).expect("nonempty index");
+        for x in -5..40 {
+            for y in -5..70 {
+                let query = [x as f64, y as f64, x as f64 + 12.0, y as f64 + 12.0];
+                let mut remaining = usize::MAX;
+                assert_eq!(index.overlaps(query, &mut remaining), rects.iter().any(|r| rectangles_overlap(*r, query)));
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_widget_geometry_exhausts_budget_without_accepting_unchecked_fields() {
+        let existing = vec![[1e9, 1e9, -1e9, -1e9]; 100_000];
+        let shapes = Shapes {
+            boxes: (0..MAX_DETECTION_BOXES)
+                .map(|i| {
+                    let x = i as f64 * 30.0;
+                    [x, 0.0, x + 10.0, 10.0]
+                })
+                .collect(),
+            rules: Vec::new(),
+        };
+        COMPARISONS.set(0);
+        INDEX_VISITS.set(0);
+        let candidates = detect(&[], &shapes, &existing, &[]);
+        assert!(candidates.is_empty(), "an exhausted search cannot verify any proposal");
+        assert!(INDEX_VISITS.get() <= 64 * MAX_DETECTION_BOXES);
+        assert!(COMPARISONS.get() < 5 * MAX_DETECTION_BOXES * MAX_DETECTION_BOXES);
     }
 }

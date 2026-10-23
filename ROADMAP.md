@@ -1,5 +1,7 @@
 # PdfCraft roadmap
 
+> **2026-10-23 review candidate (#2953, M6):** spatially index every existing widget for proposal exclusions; retain the rectangle proposal budget. 147 forms tests, strict Clippy, wasm, formatting, layering and asset gates pass; the linear-scan negative control fails as expected. Estimates unchanged.
+
 **Stage: alpha** · next: beta, ~25% (ready for real work 50% → 75%) and ~400–700 h away
 
 > **Last reviewed:** 2026-10-21 · **Last updated:** 2026-10-21 · **Change:** minor (M3, #3808: the Pages inspector has an independent 50–150% thumbnail size slider and buttons; selection and current-page following are retained, with headless ui.set coverage. Estimates unchanged.)

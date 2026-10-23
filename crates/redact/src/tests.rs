@@ -2087,6 +2087,14 @@ fn form_tags_are_cleaned_and_surviving_references_point_at_the_copy() {
     let Object::Stream(s) = &*doc.get(reference) else { panic!() };
     assert!(String::from_utf8(s.decoded().unwrap()).unwrap().contains("Public"));
     assert!(doc.get(ObjRef::new(11, 0)).as_dict().unwrap().contains(b"ActualText"));
+    let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+    let root = saved.get(saved.root().unwrap()).as_dict().unwrap().get(b"StructTreeRoot").cloned().unwrap();
+    let tree = saved.resolve(&root);
+    let parent = saved.resolve(tree.as_dict().unwrap().get(b"ParentTree").unwrap());
+    let entries = parent.as_dict().unwrap().get(b"Nums").unwrap().as_array().unwrap();
+    assert_eq!(entries.first().and_then(Object::as_int), Some(0), "the replacement form keeps its parent-tree key");
+    let parents = entries.get(1).and_then(Object::as_array).unwrap();
+    assert!(parents.get(1).and_then(Object::as_ref).is_some(), "the surviving MCID retains its mapping");
 }
 
 #[test]
@@ -2662,4 +2670,47 @@ fn redacted_and_deleted_objects_leave_no_references_anywhere_in_saved_file() {
         .unwrap_or_default();
     let keys: Vec<i64> = pt.chunks(2).filter_map(|pair| pair.first().and_then(Object::as_int)).collect();
     assert_eq!(keys, [4], "only the surviving field's parent-tree entry remains: {pt:?}");
+}
+
+#[test]
+fn distant_pattern_copies_fail_closed_when_enumeration_is_bounded() {
+    for (xstep, ystep) in [(10.0, 10.0), (0.0001, 10.0), (10.0, 0.0001)] {
+        let pattern = stream(
+            &format!(
+                "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] /XStep {xstep} /YStep {ystep} /Resources << /Font << /F1 5 0 R >> >>"
+            ),
+            b"BT /F1 2 Tf 1 5 Td (SECRET) Tj ET",
+        );
+        let mut doc = one_page(b"/Pattern cs /Pat scn 0 0 300 300 re f", "/Pattern << /Pat 7 0 R >>", vec![pattern]);
+        let rect = [100.0, 100.0, 400.0, 110.0];
+        assert!(under(&mut doc, 0, &[rect]) > 0, "distant copies must be inspected for steps {xstep}, {ystep}");
+        mark(&mut doc, 0, &[rect], "");
+        apply(&mut doc, None).unwrap();
+        assert_no_secret(&doc, b"SECRET");
+        let mut saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+        assert_eq!(under(&mut saved, 0, &[rect]), 0);
+    }
+}
+
+#[test]
+fn retained_forms_and_stencils_keep_their_selected_patterns() {
+    for paint in ["/Fm Do", "q 10 0 0 10 100 100 cm /Im Do Q", "q 10 0 0 10 100 100 cm BI /W 1 /H 1 /IM true /BPC 1 ID \0 EI Q"] {
+        let data = format!("BT /F1 10 Tf 10 200 Td (SECRET) Tj ET /Pattern cs /Pat scn {paint}");
+        let pattern = stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 300 300] /XStep 1000 /YStep 1000 /Resources << >>",
+            b"0 0 10 10 re f",
+        );
+        let form = stream("/Type /XObject /Subtype /Form /BBox [100 100 110 110]", b"100 100 10 10 re f");
+        let image = stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ImageMask true /BitsPerComponent 1", [0]);
+        let mut doc = one_page(data.as_bytes(), "/Pattern << /Pat 7 0 R >> /XObject << /Fm 8 0 R /Im 9 0 R >>", vec![pattern, form, image]);
+        mark(&mut doc, 0, &[[5.0, 195.0, 60.0, 212.0]], "");
+        apply(&mut doc, None).unwrap();
+        let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+        let data = content(&saved, 0);
+        assert!(data.contains("/Pat scn"), "retained paint lost its fill pattern: {paint}: {data}");
+        let page = pdfcraft_model::pages(&saved).remove(0);
+        let resources = saved.resolve(page.dict.get(b"Resources").unwrap());
+        let patterns = saved.resolve(resources.as_dict().unwrap().get(b"Pattern").unwrap());
+        assert!(patterns.as_dict().unwrap().contains(b"Pat"));
+    }
 }

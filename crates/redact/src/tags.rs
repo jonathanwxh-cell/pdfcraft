@@ -429,6 +429,11 @@ pub(crate) fn drop_object_refs(doc: &mut Document, gone: &HashSet<ObjRef>) -> Re
     drop_object_refs_within(doc, gone, MAX_STRUCT_REFS)
 }
 
+/// Retain parent-tree keys still declared by live replacement objects.
+pub(crate) fn drop_object_refs_preserving(doc: &mut Document, gone: &HashSet<ObjRef>, replacements: &HashSet<ObjRef>) -> Result<usize, RedactError> {
+    drop_object_refs_within_preserving(doc, gone, replacements, MAX_STRUCT_REFS)
+}
+
 /// The most structure-tree references [`drop_object_refs`] visits.
 const MAX_STRUCT_REFS: usize = 2_000_000;
 
@@ -438,6 +443,15 @@ const MAX_STRUCT_REFS: usize = 2_000_000;
 /// a cleanup that leaves the annotation reachable (removing only the tree would not: an outline
 /// item's `/SE` or a link's `/SD` still reaches its elements).
 pub(crate) fn drop_object_refs_within(doc: &mut Document, gone: &HashSet<ObjRef>, limit: usize) -> Result<usize, RedactError> {
+    drop_object_refs_within_preserving(doc, gone, &HashSet::new(), limit)
+}
+
+fn drop_object_refs_within_preserving(
+    doc: &mut Document,
+    gone: &HashSet<ObjRef>,
+    replacements: &HashSet<ObjRef>,
+    limit: usize,
+) -> Result<usize, RedactError> {
     if gone.is_empty() {
         return Ok(0);
     }
@@ -459,6 +473,15 @@ pub(crate) fn drop_object_refs_within(doc: &mut Document, gone: &HashSet<ObjRef>
             }
             if let Some(sp) = d.int(b"StructParents") {
                 struct_parents.insert(sp);
+            }
+        }
+    }
+    for r in replacements.difference(gone) {
+        if let Some(d) = doc.get(*r).as_dict() {
+            for key in [b"StructParent".as_slice(), b"StructParents"] {
+                if let Some(sp) = d.int(key) {
+                    struct_parents.remove(&sp);
+                }
             }
         }
     }

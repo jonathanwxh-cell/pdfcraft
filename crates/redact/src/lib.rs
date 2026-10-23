@@ -374,6 +374,7 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     let mut doomed_fields: Vec<String> = Vec::new();
     // The original image and form XObjects the rewrite drops or replaces, on any page.
     let mut doomed_xobjects: Vec<ObjRef> = Vec::new();
+    let mut replacements = HashSet::new();
     let mut retired_properties = Vec::new();
     let widget_owner: Vec<(ObjRef, String)> =
         pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.name.clone())).collect::<Vec<_>>()).collect();
@@ -402,6 +403,7 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
             return Err(RedactError::VerticalText(pi + 1));
         }
         doomed_xobjects.extend_from_slice(&out.doomed);
+        replacements.extend(out.replacements.iter().copied());
         retired_properties.extend(std::mem::take(&mut out.retired_properties));
         let mut new_list = list.clone();
         let mut changed = false;
@@ -566,7 +568,7 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         }
     }
     pre_gone.extend(listed_before.difference(&listed_annotations(doc)).copied());
-    report.tags += tags::drop_object_refs(doc, &pre_gone)?;
+    report.tags += tags::drop_object_refs_preserving(doc, &pre_gone, &replacements)?;
 
     // 3. Form fields with a widget under a mark (all their widgets go).
     for name in &doomed_fields {
@@ -581,7 +583,7 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     // comment text and the field value included. Widgets of a removed field on other pages count.
     let mut gone: HashSet<ObjRef> = listed_before.difference(&listed_annotations(doc)).copied().collect();
     gone.extend(pre_gone);
-    report.tags += tags::drop_object_refs(doc, &gone)?;
+    report.tags += tags::drop_object_refs_preserving(doc, &gone, &replacements)?;
     if let Some(root) = doc.root() {
         let clean_af = |doc: &mut Document, mut af: Dict| -> Dict {
             if let Some(fields_obj) = af.get(b"Fields").cloned() {

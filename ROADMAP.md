@@ -189,6 +189,7 @@ Ranked; detail and the full milestone table in [docs/roadmap.md](docs/roadmap.md
 | 8 | 1.0 polish: performance, right-to-left, missing languages, keyboard-only (M14) | 55–95 |
 
 ## Progress log
+- **2026-10-23 (M8/M6, #4092 review candidate):** Redaction conservatively covers tiling-pattern cells when copy enumeration exceeds its bound or steps are too small, retains pattern selections used by surviving forms/stencils, and preserves parent-tree keys used by replacement form content. Field deletion prunes empty inheritable-type containers only along verified child links. Synthetic security/preservation regressions pass with four original-source negative controls. Scoped Clippy (`--no-deps`), formatting, layering, assets and wasm checks pass; dependency-inclusive Clippy is blocked by an unchanged `edit/images.rs` collapsible-match warning under Rust 1.95. CI remains pending. Estimates unchanged.
 - **2026-10-13 (M7, free image rotation):** A selected page image has a rotate knob (Shift: 15 degree steps) and `image_edit` a `rotate_by` action; the angle is written as one undoable `cm`. Snapping to page edges while moving is in #1740; resize snapping is not done. Estimates unchanged.
 
 - **2026-10-20 (M4, initial view):** Window and interface options read indirect boolean ViewerPreferences values. Synthetic regressions cover true/false, direct/indirect preference dictionaries and save/reopen; malformed entries retain false defaults. Estimates unchanged.

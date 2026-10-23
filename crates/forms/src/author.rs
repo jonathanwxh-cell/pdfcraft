@@ -1255,8 +1255,13 @@ pub fn delete_field(doc: &mut Document, name: &str) -> Result<(), FormError> {
         let mut d = doc.get(p).as_dict().cloned().unwrap_or_default();
         let kids_obj = d.get(b"Kids").cloned();
         let list = kids_obj.as_ref().map(|o| doc.resolve(o)).and_then(|o| o.as_array().cloned()).unwrap_or_default();
+        // A malformed /Parent alone does not establish a non-terminal relationship.
+        if !list.iter().any(|o| o.as_ref() == Some(cur)) {
+            break;
+        }
         let kept: Vec<Object> = list.into_iter().filter(|o| !o.as_ref().is_some_and(|r| removed.contains(&r))).collect();
-        if kept.is_empty() && !d.contains(b"FT") && d.name(b"Subtype") != Some(b"Widget") {
+        // A parent of a field is non-terminal even when it declares inheritable /FT.
+        if kept.is_empty() {
             d.remove(b"Kids");
             doc.set(p, Object::Dict(d));
             removed.insert(p);

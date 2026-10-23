@@ -2989,7 +2989,7 @@ fn deleting_a_field_removes_every_reference_from_co_ancestors_and_structure_tree
         "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 600 800] >>".into(),        // 2
         "<< /Type /Page /Parent 2 0 R /Annots [7 0 R 8 0 R] >>".into(),                    // 3
         "<< /Fields [5 0 R 8 0 R] /CO [6 0 R 8 0 R] >>".into(),                            // 4
-        "<< /T (secret_group) /Kids [6 0 R] >>".into(),                                    // 5
+        "<< /FT /Tx /T (secret_group) /V (SECRET_PARENT_VALUE) /DV (SECRET_PARENT_DEFAULT) /Kids [6 0 R] >>".into(),                                    // 5
         "<< /FT /Tx /T (ssn) /Parent 5 0 R /V (SECRET_SSN_VALUE) /Kids [7 0 R] /AA << /C << /S /JavaScript /JS (SECRET_CALC_JS) >> >> >>".into(), // 6
         "<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [50 700 250 720] /P 3 0 R /StructParent 1 >>".into(), // 7
         "<< /Type /Annot /Subtype /Widget /FT /Tx /T (public_total) /V (KEEP_TOTAL) /Rect [50 650 250 670] /P 3 0 R /StructParent 2 >>".into(), // 8
@@ -3001,9 +3001,19 @@ fn deleting_a_field_removes_every_reference_from_co_ancestors_and_structure_tree
         "<< /Nums [1 12 0 R 2 13 0 R 3 7 0 R 4 9 0 R] >>".into(),                          // 14
     ]);
     delete_field(&mut doc, "secret_group.ssn").unwrap();
+    assert_eq!(fields(&doc).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["public_total"]);
     let bytes = pdfcraft_cos::write_full(&doc, &SaveOptions { object_streams: false, ..SaveOptions::default() }).unwrap();
     let saved = Document::open(Arc::new(bytes.clone())).unwrap();
-    for secret in [&b"SECRET_SSN_VALUE"[..], b"SECRET_CALC_JS", b"SECRET_TAG_TITLE", b"SECRET_TAG_ALT", b"secret_group", b"(ssn)"] {
+    for secret in [
+        &b"SECRET_SSN_VALUE"[..],
+        b"SECRET_CALC_JS",
+        b"SECRET_PARENT_VALUE",
+        b"SECRET_PARENT_DEFAULT",
+        b"SECRET_TAG_TITLE",
+        b"SECRET_TAG_ALT",
+        b"secret_group",
+        b"(ssn)",
+    ] {
         assert!(!bytes.windows(secret.len()).any(|w| w == secret), "{} survived full save", String::from_utf8_lossy(secret));
     }
     assert_eq!(calculation_order(&saved, &fields(&saved)).extra, ["public_total"]);
@@ -3018,4 +3028,20 @@ fn deleting_a_field_removes_every_reference_from_co_ancestors_and_structure_tree
         .unwrap_or_default();
     let keys: Vec<i64> = pt.chunks(2).filter_map(|pair| pair.first().and_then(Object::as_int)).collect();
     assert_eq!(keys, [2], "only the surviving field's parent-tree entry remains: {pt:?}");
+}
+
+#[test]
+fn deleting_a_field_does_not_prune_an_unrelated_terminal_named_as_parent() {
+    let mut doc = document(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 600 800] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /Annots [5 0 R 6 0 R] >>".into(),
+        "<< /Fields [5 0 R 6 0 R] >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (secret) /Parent 6 0 R /V (REMOVE) /Rect [0 0 10 10] >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (public) /V (KEEP) /Rect [20 0 30 10] >>".into(),
+    ]);
+    delete_field(&mut doc, "secret").unwrap();
+    let bytes = pdfcraft_cos::write_full(&doc, &SaveOptions::default()).unwrap();
+    let saved = Document::open(Arc::new(bytes)).unwrap();
+    assert_eq!(fields(&saved).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["public"]);
 }

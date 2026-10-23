@@ -80,6 +80,8 @@ pub(crate) struct Output {
     /// dictionaries may name them too (an inherited or shared /Resources, or the caller's when a
     /// form has none of its own): [`unlink_doomed`] removes those entries.
     pub doomed: Vec<ObjRef>,
+    /// Rewritten form/image objects, including nested replacements, that may retain parent-tree keys.
+    pub replacements: Vec<ObjRef>,
     /// Original property values retired by this scope or a nested form. Other resource holders
     /// may still name them; unlink only entries no surviving content uses.
     pub retired_properties: Vec<Object>,
@@ -1107,15 +1109,11 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                 }
                 b"g" | b"rg" | b"k" | b"sc" => gs.fill_pattern = None,
                 b"G" | b"RG" | b"K" | b"SC" => gs.stroke_pattern = None,
-                b"cs" => {
-                    if op.name(0) != Some(b"Pattern") {
-                        gs.fill_pattern = None;
-                    }
+                b"cs" if op.name(0) != Some(b"Pattern") => {
+                    gs.fill_pattern = None;
                 }
-                b"CS" => {
-                    if op.name(0) != Some(b"Pattern") {
-                        gs.stroke_pattern = None;
-                    }
+                b"CS" if op.name(0) != Some(b"Pattern") => {
+                    gs.stroke_pattern = None;
                 }
                 b"scn" | b"SCN" => {
                     let is_fill = o == b"scn";
@@ -1252,6 +1250,8 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                             continue;
                         }
                     }
+                    // A retained inline image may be a stencil painted with the fill pattern.
+                    painted_patterns.extend(gs.fill_pattern.iter().cloned());
                 }
                 b"sh" if scope.mode == Mode::Apply => {
                     // A shading fills the current clip: clip the regions out.
@@ -1265,7 +1265,13 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                     }
                 }
                 b"Do" => {
-                    if let Some(new) = xobject(doc, scope, &op, &gs, resources, &mut xobjects, &mut out) {
+                    let replacement = xobject(doc, scope, &op, &gs, resources, &mut xobjects, &mut out);
+                    // Retained forms inherit colour state, and image masks use the fill colour.
+                    if !matches!(replacement, Some(None)) {
+                        painted_patterns.extend(gs.fill_pattern.iter().cloned());
+                        painted_patterns.extend(gs.stroke_pattern.iter().cloned());
+                    }
+                    if let Some(new) = replacement {
                         changed = true;
                         if let Some(n) = new {
                             ops.push(n);
@@ -1576,6 +1582,7 @@ fn sanitize_stream_form(
     out.doomed.extend_from_slice(&inner.doomed);
     out.retired_properties.extend(inner.retired_properties.clone());
     out.tag_changes.extend(inner.tag_changes.clone());
+    out.replacements.extend_from_slice(&inner.replacements);
     out.error = inner.error.clone().or(out.error.take());
     if scope.mode == Mode::Verify {
         return StreamOutcome::Unchanged;
@@ -1613,6 +1620,7 @@ fn sanitize_stream_form(
     };
     let nr = doc.add(Object::Stream(stream));
     out.tag_changes.push((r, nr, changed, empty));
+    out.replacements.push(nr);
     out.doomed.push(r);
     scope.report.forms_rewritten += 1;
     StreamOutcome::Rewritten(nr)
@@ -1733,6 +1741,11 @@ fn pattern_rects(doc: &Document, dict: &Dict, pctm: &Matrix, gs_ctm: &Matrix, m:
             let ky0 = ((pr[1] - bb[3]) / ystep).floor() as i64;
             let ky1 = ((pr[3] - bb[1]) / ystep).ceil() as i64;
             if kx1.saturating_sub(kx0) > 16 || ky1.saturating_sub(ky0) > 16 {
+                // Bounded enumeration must fail closed, not miss distant copies of the tile.
+                let whole = pctm.bbox(bb);
+                if !out.contains(&whole) {
+                    out.push(whole);
+                }
                 continue;
             }
             for kx in kx0..=kx1 {
@@ -1747,6 +1760,15 @@ fn pattern_rects(doc: &Document, dict: &Dict, pctm: &Matrix, gs_ctm: &Matrix, m:
                     }
                 }
             }
+        }
+    } else if let Some(bb) = bbox
+        && !(xstep > 1e-3 && ystep > 1e-3)
+        && !rects.is_empty()
+    {
+        // Tiny or invalid steps cannot be enumerated safely.
+        let whole = pctm.bbox(bb);
+        if !out.contains(&whole) {
+            out.push(whole);
         }
     }
     out
@@ -1833,6 +1855,7 @@ fn xobject(
                     let n = fresh_name(scope, xobjects);
                     xobjects.set(n.clone(), Object::Ref(nr));
                     out.xobjects.push((n.clone(), nr));
+                    out.replacements.push(nr);
                     out.replaced.push(name);
                     out.doomed.push(r);
                     scope.report.images_cleared += 1;

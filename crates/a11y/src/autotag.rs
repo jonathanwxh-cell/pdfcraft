@@ -40,7 +40,7 @@ struct Plan {
     page: ObjRef,
     ops: Vec<Op>,
     spans: Vec<(usize, usize)>,
-    artifacts: HashSet<usize>,
+    artifacts: HashMap<usize, usize>,
 }
 
 fn unsupported(page: usize, reason: impl Into<String>) -> AutoTagError {
@@ -187,8 +187,13 @@ fn plan_page(doc: &Document, page: &pdfcraft_model::Page, index: usize) -> Resul
         return Err(unsupported(index, "content has malformed or too many operators"));
     }
     let xobjects = page_xobjects(doc, &page.dict);
-    let (mut start, mut has_text, mut spans, mut artifacts) = (None, false, Vec::new(), HashSet::new());
+    let (mut start, mut has_text, mut spans, mut artifacts) = (None, false, Vec::new(), HashMap::new());
+    // Marked-content boundaries must enclose the whole path, not just its paint operator.
+    let mut path = None;
     for (at, op) in parsed.ops.iter().enumerate() {
+        if path.is_some() && matches!(op.op.as_slice(), b"BT" | b"Do" | b"BI" | b"sh") {
+            return Err(unsupported(index, "painted content interrupts an unfinished path"));
+        }
         match op.op.as_slice() {
             b"BT" if start.is_none() => (start, has_text) = (Some(at), false),
             b"ET" => {
@@ -202,15 +207,29 @@ fn plan_page(doc: &Document, page: &pdfcraft_model::Page, index: usize) -> Resul
             }
             b"Tj" | b"TJ" | b"'" | b"\"" if start.is_some() => has_text = true,
             name if start.is_some() && harmless_inside(name) => {}
-            name if start.is_none() && harmless_outside(name) => {}
+            name if start.is_none() && harmless_outside(name) => match name {
+                b"m" | b"re" => {
+                    path.get_or_insert(at);
+                }
+                b"n" => path = None,
+                _ => {}
+            },
             _ if start.is_none() && painted_outside(doc, &xobjects, op) => {
-                artifacts.insert(at);
+                let first = if matches!(op.op.as_slice(), b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" | b"S" | b"s") {
+                    path.take().unwrap_or(at)
+                } else {
+                    at
+                };
+                artifacts.insert(first, at);
             }
             _ => return Err(unsupported(index, format!("unsupported or painted operator {}", String::from_utf8_lossy(&op.op)))),
         }
     }
     if start.is_some() {
         return Err(unsupported(index, "unterminated BT text object"));
+    }
+    if path.is_some() {
+        return Err(unsupported(index, "unterminated path object"));
     }
     Ok(Plan { page: page.obj, ops: parsed.ops, spans, artifacts })
 }
@@ -242,11 +261,12 @@ fn plan(doc: &Document) -> Result<Vec<Plan>, AutoTagError> {
     Ok(out)
 }
 
-fn mark_ops(ops: Vec<Op>, starts: &HashMap<usize, usize>, ends: &HashSet<usize>, artifacts: &HashSet<usize>) -> Result<Vec<Op>, AutoTagError> {
+fn mark_ops(ops: Vec<Op>, starts: &HashMap<usize, usize>, ends: &HashSet<usize>, artifacts: &HashMap<usize, usize>) -> Result<Vec<Op>, AutoTagError> {
+    let artifact_ends: HashSet<usize> = artifacts.values().copied().collect();
     let extra = starts.len().saturating_add(artifacts.len()).saturating_mul(2);
     let mut marked = Vec::with_capacity(ops.len().saturating_add(extra));
     for (at, op) in ops.into_iter().enumerate() {
-        let is_artifact = artifacts.contains(&at);
+        let is_artifact = artifacts.contains_key(&at);
         if let Some(mcid) = starts.get(&at) {
             let mut properties = Dict::new();
             properties.set(b"MCID".to_vec(), Object::Int(i64::try_from(*mcid).map_err(|_| AutoTagError::TooManyPages)?));
@@ -255,7 +275,7 @@ fn mark_ops(ops: Vec<Op>, starts: &HashMap<usize, usize>, ends: &HashSet<usize>,
             marked.push(Op::new("BMC", vec![Object::name("Artifact")]));
         }
         marked.push(op);
-        if ends.contains(&at) || is_artifact {
+        if ends.contains(&at) || artifact_ends.contains(&at) {
             marked.push(Op::new("EMC", Vec::new()));
         }
     }

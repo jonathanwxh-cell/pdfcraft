@@ -374,6 +374,28 @@ fn faux_redaction_over_a_short_value_after_a_long_label_is_found() {
     assert!(findings[0].covered_text.contains("4111"), "{findings:?}");
 }
 
+/// A short TJ cell must keep its own 40% threshold even beside a much longer cell.
+#[test]
+fn partial_tj_cell_cover_is_not_diluted_by_another_cell() {
+    let text = "BT /F1 11 Tf 72 742 Td [(123456789) -8000 (A much longer neighbouring table cell)] TJ ET\n";
+    let doc = open(one_page(text.as_bytes(), ""));
+    let lines = pdfcraft_edit::text_lines(&doc, 0).expect("extract synthetic cells");
+    assert_eq!(lines.len(), 2, "fixture must split into two TJ cells");
+    let cell = lines.first().expect("first cell").rect;
+    for fraction in [0.35, 0.45] {
+        let width = (cell[2] - cell[0]) * fraction;
+        let height = cell[3] - cell[1];
+        let content = format!("{text}0 g {} {} {width} {height} re f\n", cell[0], cell[1]);
+        let findings = audit_redactions(&open(one_page(content.as_bytes(), ""))).expect("audit painted cover");
+        assert_eq!(findings.len(), usize::from(fraction > 0.4), "painted fraction={fraction}");
+        for subtype in ["Square /IC [0 0 0] /CA 1", "Redact"] {
+            let annot = format!("/Annots [<< /Subtype /{subtype} /Rect [{} {} {} {}] >>]", cell[0], cell[1], cell[0] + width, cell[3]);
+            let findings = audit_redactions(&open(one_page(text.as_bytes(), &annot))).expect("audit annotation cover");
+            assert_eq!(findings.len(), usize::from(fraction > 0.4), "{subtype}, fraction={fraction}");
+        }
+    }
+}
+
 /// Text set with a negative font size in a mirrored text matrix runs its glyphs backwards: a
 /// cover over the address it draws is still found.
 #[test]
@@ -590,27 +612,5 @@ fn reading_blocks_respect_stream_comments_and_split_operands() {
         let doc = open(two_streams(s1, s2));
         let text: String = pdfcraft_edit::reading_blocks(&doc, 0).unwrap().into_iter().map(|block| block.editor_text).collect();
         assert_eq!(text, "Replacement text", "{}", String::from_utf8_lossy(s1));
-    }
-}
-
-/// A short TJ cell must keep its own 40% threshold even beside a much longer cell.
-#[test]
-fn partial_tj_cell_cover_is_not_diluted_by_another_cell() {
-    let text = "BT /F1 11 Tf 72 742 Td [(123456789) -8000 (A much longer neighbouring table cell)] TJ ET\n";
-    let doc = open(one_page(text.as_bytes(), ""));
-    let lines = pdfcraft_edit::text_lines(&doc, 0).expect("extract synthetic cells");
-    assert_eq!(lines.len(), 2, "fixture must split into two TJ cells");
-    let cell = lines.first().expect("first cell").rect;
-    for fraction in [0.35, 0.45] {
-        let width = (cell[2] - cell[0]) * fraction;
-        let height = cell[3] - cell[1];
-        let content = format!("{text}0 g {} {} {width} {height} re f\n", cell[0], cell[1]);
-        let findings = audit_redactions(&open(one_page(content.as_bytes(), ""))).expect("audit painted cover");
-        assert_eq!(findings.len(), usize::from(fraction > 0.4), "painted fraction={fraction}");
-        for subtype in ["Square /IC [0 0 0] /CA 1", "Redact"] {
-            let annot = format!("/Annots [<< /Subtype /{subtype} /Rect [{} {} {} {}] >>]", cell[0], cell[1], cell[0] + width, cell[3]);
-            let findings = audit_redactions(&open(one_page(text.as_bytes(), &annot))).expect("audit annotation cover");
-            assert_eq!(findings.len(), usize::from(fraction > 0.4), "{subtype}, fraction={fraction}");
-        }
     }
 }

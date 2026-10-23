@@ -108,7 +108,7 @@ pub fn audit_redactions(doc: &Document) -> Result<Vec<AuditFinding>, AuditError>
                     if !covered.is_empty() {
                         covered.push(' ');
                     }
-                    covered.push_str(line.text.trim());
+                    covered.push_str(line.line.text.trim());
                 }
             }
             if !covered.trim().is_empty() {
@@ -121,13 +121,13 @@ pub fn audit_redactions(doc: &Document) -> Result<Vec<AuditFinding>, AuditError>
             for line in &lines {
                 let hidden = match &annot {
                     AnnotationCover::Redact(rect) => covers(rect, line),
-                    AnnotationCover::Square { rect, rgb } => covers(rect, line) && contrast(line.color, *rgb) < COVER_CONTRAST,
+                    AnnotationCover::Square { rect, rgb } => covers(rect, line) && contrast(line.line.color, *rgb) < COVER_CONTRAST,
                 };
                 if hidden {
                     if !covered.is_empty() {
                         covered.push(' ');
                     }
-                    covered.push_str(line.text.trim());
+                    covered.push_str(line.line.text.trim());
                 }
             }
             if !covered.trim().is_empty() {
@@ -142,22 +142,35 @@ pub fn audit_redactions(doc: &Document) -> Result<Vec<AuditFinding>, AuditError>
     Ok(out)
 }
 
-/// Join cell segments split from a single `TJ` operator back into one line box so covers
-/// spanning a wide `TJ` gap and part of the following value are still measured against the
-/// whole `TJ` instruction's box.
-fn audit_lines(doc: &Document, page: usize) -> Result<Vec<TextLine>, AuditError> {
-    let mut lines: Vec<TextLine> = Vec::new();
+/// A paint operation retains both its complete line and each cell's original geometry.
+/// Joining cells must not dilute a partial cover of a short cell; the complete box is still
+/// needed for historical detections spanning a TJ gap and part of the following value.
+struct AuditLine {
+    line: TextLine,
+    segments: Vec<([f64; 4], std::ops::Range<usize>)>,
+}
+
+fn audit_lines(doc: &Document, page: usize) -> Result<Vec<AuditLine>, AuditError> {
+    let mut lines: Vec<AuditLine> = Vec::new();
     for line in pdfcraft_edit::text_lines(doc, page).map_err(|e| AuditError::Text(page, e.to_string()))? {
-        if let Some(prev) = lines.last_mut().filter(|p| p.paint_pos() == line.paint_pos()) {
-            if !prev.text.ends_with(' ') && !line.text.starts_with(' ') {
-                prev.text.push(' ');
+        if let Some(prev) = lines.last_mut().filter(|p| p.line.paint_pos() == line.paint_pos()) {
+            if !prev.line.text.ends_with(' ') && !line.text.starts_with(' ') {
+                prev.line.text.push(' ');
             }
-            prev.text.push_str(&line.text);
-            prev.rect =
-                [prev.rect[0].min(line.rect[0]), prev.rect[1].min(line.rect[1]), prev.rect[2].max(line.rect[2]), prev.rect[3].max(line.rect[3])];
-            prev.ink.extend(line.ink);
+            prev.line.text.push_str(&line.text);
+            prev.line.rect = [
+                prev.line.rect[0].min(line.rect[0]),
+                prev.line.rect[1].min(line.rect[1]),
+                prev.line.rect[2].max(line.rect[2]),
+                prev.line.rect[3].max(line.rect[3]),
+            ];
+            let start = prev.line.ink.len();
+            let rect = line.rect;
+            prev.line.ink.extend(line.ink);
+            prev.segments.push((rect, start..prev.line.ink.len()));
         } else {
-            lines.push(line);
+            let segments = vec![(line.rect, 0..line.ink.len())];
+            lines.push(AuditLine { line, segments });
         }
     }
     Ok(lines)
@@ -167,8 +180,8 @@ fn audit_lines(doc: &Document, page: usize) -> Result<Vec<TextLine>, AuditError>
 /// after the line, overlaps it substantially, and is dark enough against the line's color to
 /// make the text unreadable. Light covers (table shading, highlights) over dark text fail the
 /// contrast check and are not flagged.
-fn is_cover(rect: &cover::FilledRect, line: &TextLine) -> bool {
-    rect.pos > line.paint_pos() && covers(&rect.rect, line) && contrast(line.color, rect.rgb) < COVER_CONTRAST
+fn is_cover(rect: &cover::FilledRect, line: &AuditLine) -> bool {
+    rect.pos > line.line.paint_pos() && covers(&rect.rect, line) && contrast(line.line.color, rect.rgb) < COVER_CONTRAST
 }
 
 /// Does `cover` hide a substantial part of what `line` draws? Three ways, any is enough:
@@ -185,19 +198,24 @@ fn is_cover(rect: &cover::FilledRect, line: &TextLine) -> bool {
 ///   flagged, while a cover over the gap alone, with no word under it, stops counting.
 ///
 /// A line without word boxes is measured on its box alone.
-fn covers(cover: &[f64; 4], line: &TextLine) -> bool {
+fn covers(cover: &[f64; 4], line: &AuditLine) -> bool {
+    covers_geometry(cover, &line.line.rect, &line.line.ink)
+        || line.segments.iter().any(|(rect, range)| line.line.ink.get(range.clone()).is_some_and(|ink| covers_geometry(cover, rect, ink)))
+}
+
+fn covers_geometry(cover: &[f64; 4], rect: &[f64; 4], ink: &[[f64; 4]]) -> bool {
     let hidden = |b: &[f64; 4]| area(&[cover[0].max(b[0]), cover[1].max(b[1]), cover[2].min(b[2]), cover[3].min(b[3])]);
     let fraction = |boxes: &[[f64; 4]]| {
         let total: f64 = boxes.iter().map(area).sum();
         if total > 0.0 { boxes.iter().map(hidden).sum::<f64>() / total } else { 0.0 }
     };
-    if line.ink.iter().any(|w| area(w) > 0.0 && hidden(w) / area(w) >= WORD_FRACTION) {
+    if ink.iter().any(|w| area(w) > 0.0 && hidden(w) / area(w) >= WORD_FRACTION) {
         return true;
     }
-    let inked = fraction(&line.ink) >= COVER_FRACTION;
-    let boxed = fraction(std::slice::from_ref(&line.rect)) >= COVER_FRACTION;
-    let word_intersects = || line.ink.iter().any(|w| hidden(w) > 0.0);
-    inked || (boxed && (line.ink.is_empty() || word_intersects()))
+    let inked = fraction(ink) >= COVER_FRACTION;
+    let boxed = fraction(std::slice::from_ref(rect)) >= COVER_FRACTION;
+    let word_intersects = || ink.iter().any(|w| hidden(w) > 0.0);
+    inked || (boxed && (ink.is_empty() || word_intersects()))
 }
 
 /// The area of a rectangle, 0 when it is empty or inverted.

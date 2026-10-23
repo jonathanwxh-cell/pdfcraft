@@ -1,5 +1,7 @@
 # PdfCraft roadmap
 
+> **2026-10-23 review candidate (#3820, M8):** retain individual TJ-cell audit geometry without losing combined gap-cover detections. 34 audit tests, strict no-dependency Clippy, wasm, formatting, layering and asset gates pass; the prior implementation fails the new 45%-cell regression. Dependency-inclusive Clippy remains blocked by an unchanged edit/images.rs lint. Estimates unchanged.
+
 **Stage: alpha** · next: beta, ~25% (ready for real work 50% → 75%) and ~400–700 h away
 
 > **Last reviewed:** 2026-10-21 · **Last updated:** 2026-10-21 · **Change:** minor (M3, #3808: the Pages inspector has an independent 50–150% thumbnail size slider and buttons; selection and current-page following are retained, with headless ui.set coverage. Estimates unchanged.)

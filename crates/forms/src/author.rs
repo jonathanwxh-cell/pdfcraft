@@ -1382,7 +1382,17 @@ fn clean_tree_dict(
     all_gone: &std::collections::HashSet<ObjRef>,
     struct_parents: &std::collections::HashSet<i64>,
     emptied_elems: &std::collections::HashSet<ObjRef>,
-) -> bool {
+    changed_nodes: &std::collections::HashSet<ObjRef>,
+    limits: (usize, &mut usize),
+) -> Result<bool, FormError> {
+    let (depth, budget) = limits;
+    if *budget == 0 {
+        return invalid("structure cleanup work limit exceeded");
+    }
+    *budget -= 1;
+    if depth > 128 {
+        return invalid("structure name-tree nesting exceeds deletion limit");
+    }
     let is_empty_elem = |o: &Object| -> bool { o.as_ref().is_some_and(|r| emptied_elems.contains(&r)) };
     let mut changed = false;
     if let Some(nums_obj) = d.get(b"Nums").cloned()
@@ -1461,25 +1471,111 @@ fn clean_tree_dict(
             {
                 doc.set(names_ref, Object::Array(kept.clone()));
             }
+            if d.contains(b"Limits") {
+                if let (Some(first), Some(last)) = (kept.first(), kept.get(kept.len().saturating_sub(2))) {
+                    d.set(b"Limits".to_vec(), Object::Array(vec![first.clone(), last.clone()]));
+                } else {
+                    d.remove(b"Limits");
+                }
+            }
             d.set(b"Names".to_vec(), Object::Array(kept));
         }
     }
-    if let Some(Object::Array(mut kids)) = d.get(b"Kids").cloned() {
-        let mut kids_changed = false;
+    let mut kids_changed = false;
+    if let Some(kids_obj) = d.get(b"Kids").cloned()
+        && let Some(mut kids) = doc.resolve(&kids_obj).as_array().cloned()
+    {
         for kid in &mut kids {
+            kids_changed |= kid.as_ref().is_some_and(|r| changed_nodes.contains(&r));
             if let Object::Dict(kd) = kid
                 && !kd.contains(b"S")
-                && clean_tree_dict(doc, kd, all_gone, struct_parents, emptied_elems)
+                && clean_tree_dict(doc, kd, all_gone, struct_parents, emptied_elems, changed_nodes, (depth + 1, budget))?
             {
                 kids_changed = true;
             }
         }
         if kids_changed {
             changed = true;
+            if let Some(r) = kids_obj.as_ref() {
+                doc.set(r, Object::Array(kids.clone()));
+            }
             d.set(b"Kids".to_vec(), Object::Array(kids));
         }
     }
-    changed
+    if kids_changed
+        && d.get(b"Limits").map(|l| doc.resolve(l)).is_some_and(|l| l.as_array().is_some_and(|a| a.iter().any(|v| matches!(v, Object::String(_)))))
+        && !d.contains(b"Names")
+        && let Some(kids) = d.get(b"Kids").map(|k| doc.resolve(k))
+        && let Some(kids) = kids.as_array()
+    {
+        let bounds: Vec<Object> = kids
+            .iter()
+            .filter_map(|k| doc.resolve(k).as_dict().and_then(|d| d.get(b"Limits")).map(|l| doc.resolve(l)))
+            .filter_map(|l| l.as_array().cloned())
+            .flatten()
+            .collect();
+        let limits = match (bounds.first(), bounds.last()) {
+            (Some(first), Some(last)) => Some(Object::Array(vec![first.clone(), last.clone()])),
+            _ => None,
+        };
+        if d.get(b"Limits") != limits.as_ref() {
+            changed = true;
+            if let Some(limits) = limits {
+                d.set(b"Limits".to_vec(), limits);
+            } else {
+                d.remove(b"Limits");
+            }
+        }
+    }
+
+    Ok(changed)
+}
+
+// Prune only elements made empty by this deletion, including direct containers.
+// References to live structure elements are handled by the bounded reverse-edge walk.
+fn prune_empty_struct_k(
+    doc: &Document,
+    value: &Object,
+    gone: &std::collections::HashSet<ObjRef>,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Option<Object>, FormError> {
+    if *budget == 0 {
+        return invalid("structure cleanup work limit exceeded");
+    }
+    *budget -= 1;
+    if depth > 128 {
+        return invalid("structure child nesting exceeds deletion limit");
+    }
+    if struct_refers_to(doc, value, gone) {
+        return Ok(None);
+    }
+    let resolved = doc.resolve(value);
+    match &*resolved {
+        Object::Array(items) => {
+            let mut kept = Vec::with_capacity(items.len());
+            for item in items {
+                if let Some(item) = prune_empty_struct_k(doc, item, gone, depth + 1, budget)? {
+                    kept.push(item);
+                }
+            }
+            if kept.len() == items.len() && kept == *items {
+                Ok(Some(value.clone()))
+            } else if kept.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(Object::Array(kept)))
+            }
+        }
+        Object::Dict(d) if value.as_ref().is_none() && d.contains(b"S") => {
+            let Some(k) = d.get(b"K") else { return Ok(Some(value.clone())) };
+            let Some(kept) = prune_empty_struct_k(doc, k, gone, depth + 1, budget)? else { return Ok(None) };
+            let mut d = d.clone();
+            d.set(b"K".to_vec(), kept);
+            Ok(Some(Object::Dict(d)))
+        }
+        _ => Ok(Some(value.clone())),
+    }
 }
 
 fn drop_struct_tree_refs(doc: &mut Document, gone: &std::collections::HashSet<ObjRef>) -> Result<(), FormError> {
@@ -1506,31 +1602,53 @@ fn drop_struct_tree_refs(doc: &mut Document, gone: &std::collections::HashSet<Ob
         }
     }
     let mut all_gone = gone.clone();
-    let mut todo: Vec<Object> = [&b"K"[..], b"ParentTree", b"IDTree"].iter().filter_map(|k| root.get(k).cloned()).collect();
+    let mut cleanup_budget = 2_000_000;
+    let mut todo: Vec<(Object, Option<ObjRef>)> =
+        [&b"K"[..], b"ParentTree", b"IDTree"].iter().filter_map(|k| root.get(k).cloned().map(|o| (o, None))).collect();
+    let mut parents: std::collections::HashMap<ObjRef, Vec<ObjRef>> = std::collections::HashMap::new();
     let mut seen = std::collections::HashSet::new();
+    let mut seen_arrays = std::collections::HashSet::new();
     let mut elem_hits: Vec<ObjRef> = Vec::new();
     let mut tree_nodes: Vec<ObjRef> = Vec::new();
-    while let Some(k) = todo.pop() {
+    while let Some((k, parent)) = todo.pop() {
         match k {
-            Object::Array(a) => todo.extend(a),
+            Object::Array(a) => todo.extend(a.into_iter().map(|o| (o, parent))),
             Object::Dict(d) if d.contains(b"S") => {
                 if let Some(kids) = d.get(b"K") {
-                    todo.push(kids.clone());
+                    if let Some(parent) = parent
+                        && prune_empty_struct_k(doc, kids, &all_gone, 0, &mut cleanup_budget)?.as_ref() != Some(kids)
+                    {
+                        elem_hits.push(parent);
+                    }
+                    todo.push((kids.clone(), parent));
                 }
             }
             Object::Dict(d) => {
-                todo.extend([&b"Nums"[..], b"Names", b"Kids"].iter().filter_map(|key| d.get(key).cloned()));
+                todo.extend([&b"Nums"[..], b"Names", b"Kids"].iter().filter_map(|key| d.get(key).cloned().map(|o| (o, None))));
             }
             Object::Ref(r) => {
                 if struct_refers_to(doc, &Object::Ref(r), gone) {
                     all_gone.insert(r);
                 }
-                if !seen.insert(r) || seen.len() > 2_000_000 {
-                    continue;
+                if let Some(parent) = parent
+                    && doc.get(r).as_dict().is_some_and(|d| d.contains(b"S"))
+                {
+                    parents.entry(r).or_default().push(parent);
                 }
                 let object = doc.get(r);
-                if let Object::Array(a) = &*object {
-                    todo.extend(a.iter().cloned());
+                if let Object::Array(items) = &*object {
+                    if seen_arrays.insert((r, parent)) {
+                        if seen.len() + seen_arrays.len() > 2_000_000 {
+                            return invalid("structure tree exceeds deletion limit");
+                        }
+                        todo.extend(items.iter().cloned().map(|o| (o, parent)));
+                    }
+                    continue;
+                }
+                if seen.len() + seen_arrays.len() > 2_000_000 {
+                    return invalid("structure tree exceeds deletion limit");
+                }
+                if !seen.insert(r) {
                     continue;
                 }
                 let Some(d) = object.as_dict() else { continue };
@@ -1538,7 +1656,7 @@ fn drop_struct_tree_refs(doc: &mut Document, gone: &std::collections::HashSet<Ob
                     if d.contains(b"Nums") || d.contains(b"Names") || d.contains(b"Kids") {
                         tree_nodes.push(r);
                     }
-                    todo.extend([&b"Nums"[..], b"Names", b"Kids"].iter().filter_map(|key| d.get(key).cloned()));
+                    todo.extend([&b"Nums"[..], b"Names", b"Kids"].iter().filter_map(|key| d.get(key).cloned().map(|o| (o, None))));
                     continue;
                 }
                 let kids: Vec<Object> = match d.get(b"K").map(|k| doc.resolve(k)).as_deref() {
@@ -1556,7 +1674,7 @@ fn drop_struct_tree_refs(doc: &mut Document, gone: &std::collections::HashSet<Ob
                 if kids.iter().any(|x| struct_refers_to(doc, x, &all_gone)) {
                     elem_hits.push(r);
                 }
-                todo.extend(kids);
+                todo.extend(kids.into_iter().map(|o| (o, Some(r))));
             }
             _ => {}
         }
@@ -1571,7 +1689,12 @@ fn drop_struct_tree_refs(doc: &mut Document, gone: &std::collections::HashSet<Ob
             Some(_) => d.get(b"K").cloned().into_iter().collect(),
             None => Vec::new(),
         };
-        let keep: Vec<Object> = list.into_iter().filter(|x| !struct_refers_to(doc, x, &all_gone)).collect();
+        let mut keep = Vec::new();
+        for child in list {
+            if let Some(child) = prune_empty_struct_k(doc, &child, &all_gone, 0, &mut cleanup_budget)? {
+                keep.push(child);
+            }
+        }
         if keep.is_empty() {
             emptied_elems.insert(r);
         }
@@ -1584,23 +1707,60 @@ fn drop_struct_tree_refs(doc: &mut Document, gone: &std::collections::HashSet<Ob
                 e.remove(b"K");
             }
             if keep.is_empty() {
-                for key in [&b"Alt"[..], b"ActualText", b"T", b"E"] {
+                for key in [&b"Alt"[..], b"ActualText", b"T", b"E", b"ID", b"A"] {
                     e.remove(key);
                 }
             }
         })?;
     }
-    for r in tree_nodes {
+    let mut pending: Vec<ObjRef> = emptied_elems.iter().copied().collect();
+    while let Some(empty) = pending.pop() {
+        for parent in parents.remove(&empty).unwrap_or_default() {
+            if emptied_elems.contains(&parent) {
+                continue;
+            }
+            let Some(k) = doc.get(parent).as_dict().and_then(|d| d.get(b"K").cloned()) else { continue };
+            let kept = prune_empty_struct_k(doc, &k, &emptied_elems, 0, &mut cleanup_budget)?;
+            if kept.is_none() && emptied_elems.insert(parent) {
+                pending.push(parent);
+            }
+            doc.update_dict(parent, |d| {
+                if let Some(k) = kept.clone() {
+                    d.set(b"K".to_vec(), k);
+                } else {
+                    d.remove(b"K");
+                    for key in [&b"Alt"[..], b"ActualText", b"T", b"E", b"ID", b"A"] {
+                        d.remove(key);
+                    }
+                }
+            })?;
+        }
+    }
+    all_gone.extend(emptied_elems.iter().copied());
+    let mut changed_nodes = std::collections::HashSet::new();
+    for r in tree_nodes.into_iter().rev() {
         let Some(mut d) = doc.get(r).as_dict().cloned() else { continue };
-        if clean_tree_dict(doc, &mut d, &all_gone, &struct_parents, &emptied_elems) {
+        if clean_tree_dict(doc, &mut d, &all_gone, &struct_parents, &emptied_elems, &changed_nodes, (0, &mut cleanup_budget))? {
             doc.set(r, Object::Dict(d));
+            changed_nodes.insert(r);
         }
     }
     let mut new_root = root.clone();
     let mut root_changed = false;
+    if let Some(k) = new_root.get(b"K").cloned() {
+        let kept = prune_empty_struct_k(doc, &k, &all_gone, 0, &mut cleanup_budget)?;
+        if kept.as_ref() != Some(&k) {
+            root_changed = true;
+            if let Some(k) = kept {
+                new_root.set(b"K".to_vec(), k);
+            } else {
+                new_root.remove(b"K");
+            }
+        }
+    }
     for key in [&b"ParentTree"[..], b"IDTree"] {
         if let Some(Object::Dict(mut td)) = new_root.get(key).cloned()
-            && clean_tree_dict(doc, &mut td, &all_gone, &struct_parents, &emptied_elems)
+            && clean_tree_dict(doc, &mut td, &all_gone, &struct_parents, &emptied_elems, &changed_nodes, (0, &mut cleanup_budget))?
         {
             new_root.set(key.to_vec(), Object::Dict(td));
             root_changed = true;
@@ -1703,4 +1863,24 @@ pub fn duplicate_field(doc: &mut Document, name: &str, pages: &[usize]) -> Resul
     })?;
     redraw_field(doc, name)?;
     Ok(added.len())
+}
+
+#[cfg(test)]
+mod structure_cleanup_limits {
+    use super::*;
+
+    #[test]
+    fn recursive_cleanup_shares_one_work_budget() {
+        let mut doc = Document::new_empty();
+        let gone = std::collections::HashSet::new();
+        let leaves = Object::Array(vec![Object::Null; 8]);
+        let mut budget = 3;
+        assert!(prune_empty_struct_k(&doc, &leaves, &gone, 0, &mut budget).is_err());
+        assert_eq!(budget, 0);
+        let mut node = Dict::new();
+        let mut budget = 1;
+        assert!(!clean_tree_dict(&mut doc, &mut node, &gone, &std::collections::HashSet::new(), &gone, &gone, (0, &mut budget)).unwrap());
+        assert!(clean_tree_dict(&mut doc, &mut node, &gone, &std::collections::HashSet::new(), &gone, &gone, (0, &mut budget)).is_err());
+        assert_eq!(budget, 0);
+    }
 }

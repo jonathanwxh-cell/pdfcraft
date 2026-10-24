@@ -5739,6 +5739,32 @@ fn optimizing_through_tools() {
     let retained = ok(&mut a, "doc_optimize", json!({ "doc": cat_doc, "path": "retained.pdf", "compatibility": "retain", "object_streams": false }));
     assert_eq!(retained["pdf_version"].as_str(), Some("1.6"), "{retained}");
 
+    // A lower catalog /Version cannot hide the written header, including the writer's
+    // automatic upgrade to PDF 1.5 when object streams are enabled.
+    cos14.update_dict(root, |c| c.set(b"Version".to_vec(), pdfcraft_cos::Object::name("1.4"))).unwrap();
+    for (label, header, object_streams, expected) in [
+        ("raised", "1.4", true, "1.5"),
+        ("higher-header", "1.7", false, "1.7"),
+        ("equal", "1.4", false, "1.4"),
+    ] {
+        cos14.set_version(header);
+        let input = pdfcraft_cos::write_full(&cos14, &pdfcraft_cos::SaveOptions { object_streams: false, ..Default::default() }).unwrap();
+        let input_path = format!("{label}-input.pdf");
+        let output_path = format!("{label}-output.pdf");
+        std::fs::write(dir.join(&input_path), input).unwrap();
+        let input_doc = ok(&mut a, "doc_open", json!({ "path": input_path }))["doc"].as_u64().unwrap();
+        let result = ok(
+            &mut a,
+            "doc_optimize",
+            json!({ "doc": input_doc, "path": output_path, "compatibility": "retain", "object_streams": object_streams }),
+        );
+        let output = std::fs::read(dir.join(&output_path)).unwrap();
+        assert!(output.starts_with(format!("%PDF-{expected}\n").as_bytes()), "{label}: wrong written header");
+        assert_eq!(result["pdf_version"].as_str(), Some(expected), "{label}: {result}");
+        assert_eq!(result["object_streams"].as_bool(), Some(object_streams), "{label}: {result}");
+        assert_eq!(output.windows(7).any(|w| w == b"/ObjStm"), object_streams, "{label}: written structure");
+    }
+
     assert!(matches!(a.call("doc_optimize", &json!({ "doc": doc, "path": "x.pdf", "compatibility": "1.3" })), Err(ToolError::InvalidArgs(_))));
     assert!(matches!(
         a.call("doc_optimize", &json!({ "doc": doc, "path": "x.pdf", "color": { "compression": "gif" } })),

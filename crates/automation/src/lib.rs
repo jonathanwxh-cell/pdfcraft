@@ -1295,7 +1295,12 @@ impl Automation {
             })
             .flatten();
         let header_version = bytes.strip_prefix(b"%PDF-").and_then(|b| b.get(..3)).and_then(valid_version);
-        let pdf_version = catalog_version.as_deref().or(header_version);
+        // A catalog /Version can raise the header version, never lower it. Both values are
+        // single-digit major/minor versions, so lexical ordering matches version ordering.
+        let pdf_version = match (catalog_version.as_deref(), header_version) {
+            (Some(catalog), Some(header)) => Some(catalog.max(header)),
+            (catalog, header) => catalog.or(header),
+        };
         let o = &r.optimize;
         Ok(json!({
             "path": path.to_string_lossy(),

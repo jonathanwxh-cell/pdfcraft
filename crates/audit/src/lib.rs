@@ -138,29 +138,38 @@ struct Budget {
 }
 
 impl Budget {
-    /// Resets the comparison count for a page with these `lines`.
-    fn start_page(&mut self, lines: &[AuditLine]) {
+    /// Resets the comparison count for a page with these `lines`. A line costs its word boxes
+    /// or its runs, whichever are more (at least one): a cover check walks the boxes, and the
+    /// covered text walks the runs, which can draw no words at all (`( ) Tj`).
+    fn start_page(&mut self, lines: &[TextLine]) {
         self.comparisons = 0;
-        self.page_cost = lines.iter().fold(0, |n, line| n.saturating_add(line.line.ink.len().max(1)));
+        self.page_cost = lines.iter().fold(0, |n, line| n.saturating_add(line.ink.len().max(line.runs().count()).max(1)));
     }
 
-    /// The text of the `lines` that `hides`, joined with single spaces, or `None` when they show
-    /// no text. Without `copying` the text is empty and never assembled: one long line under many
-    /// covers would otherwise be copied once per cover, outside both bounds.
-    fn hidden_text(&mut self, lines: &[AuditLine], copying: bool, hides: impl Fn(&AuditLine) -> bool) -> Result<Option<String>, AuditError> {
+    /// The text `cover` hides in the `lines` that `hides` ([`covered_words`]), joined with single
+    /// spaces, or `None` when they show no text. Without `copying` the text is empty and never
+    /// assembled: one long line under many covers would otherwise be copied once per cover,
+    /// outside both bounds.
+    fn hidden_text(
+        &mut self,
+        lines: &[TextLine],
+        copying: bool,
+        cover: &[f64; 4],
+        hides: impl Fn(&TextLine) -> bool,
+    ) -> Result<Option<String>, AuditError> {
         self.comparisons = self.comparisons.saturating_add(self.page_cost);
         if self.comparisons > self.limits.comparisons {
             return Err(AuditError::TooManyComparisons);
         }
         if !copying {
-            return Ok(lines.iter().any(|line| hides(line) && !line.line.text.trim().is_empty()).then(String::new));
+            return Ok(lines.iter().any(|line| hides(line) && !line.text.trim().is_empty()).then(String::new));
         }
         let mut covered = String::new();
         for line in lines.iter().filter(|l| hides(l)) {
             if !covered.is_empty() {
                 covered.push(' ');
             }
-            covered.push_str(line.line.text.trim());
+            covered_words(cover, line, &mut covered);
         }
         Ok((!covered.trim().is_empty()).then_some(covered))
     }
@@ -184,20 +193,23 @@ fn audit(doc: &Document, limits: Limits) -> Result<Vec<AuditFinding>, AuditError
     for (n, page) in pdfcraft_model::pages(doc).iter().enumerate() {
         // The glyphs themselves: `/ActualText` is the file's own claim about them, and an empty
         // or substitute one must not hide text a cover sits on.
-        let lines = audit_lines(doc, n, page)?;
+        let lines = pdfcraft_edit::glyph_text_lines(doc, page).map_err(|e| AuditError::Text(n, e.to_string()))?;
         budget.start_page(&lines);
         // 1. Opaque filled rectangles over extractable text.
         for r in cover::filled_rects(doc, &page.dict)? {
-            if let Some(covered) = budget.hidden_text(&lines, copying, |line| is_cover(&r, line))? {
+            if let Some(covered) = budget.hidden_text(&lines, copying, &r.rect, |line| is_cover(&r, line))? {
                 let covered_text = budget.report_text(covered, copying)?;
                 out.push(AuditFinding { page: n, kind: FindingKind::CoveredText, rect: r.rect, covered_text });
             }
         }
         // 2. Annotation covers over extractable text.
         for annot in annots(doc, &page.dict)? {
-            if let Some(covered) = budget.hidden_text(&lines, copying, |line| match &annot {
+            let cover = match &annot {
+                AnnotationCover::Redact(rect) | AnnotationCover::Square { rect, .. } => *rect,
+            };
+            if let Some(covered) = budget.hidden_text(&lines, copying, &cover, |line| match &annot {
                 AnnotationCover::Redact(rect) => covers(rect, line),
-                AnnotationCover::Square { rect, rgb } => covers(rect, line) && contrast(line.line.color, *rgb) < COVER_CONTRAST,
+                AnnotationCover::Square { rect, rgb } => covers(rect, line) && contrast(line.color, *rgb) < COVER_CONTRAST,
             })? {
                 let (kind, rect) = match annot {
                     AnnotationCover::Redact(rect) => (FindingKind::UnappliedMark, rect),
@@ -211,48 +223,14 @@ fn audit(doc: &Document, limits: Limits) -> Result<Vec<AuditFinding>, AuditError
     Ok(out)
 }
 
-/// A paint operation retains both its complete line and each cell's original geometry.
-/// Joining cells must not dilute a partial cover of a short cell; the complete box is still
-/// needed for historical detections spanning a TJ gap and part of the following value.
-struct AuditLine {
-    line: TextLine,
-    segments: Vec<([f64; 4], std::ops::Range<usize>)>,
-}
-
-fn audit_lines(doc: &Document, page_index: usize, page: &pdfcraft_model::Page) -> Result<Vec<AuditLine>, AuditError> {
-    let mut lines: Vec<AuditLine> = Vec::new();
-    for line in pdfcraft_edit::glyph_text_lines(doc, page).map_err(|e| AuditError::Text(page_index, e.to_string()))? {
-        if let Some(prev) = lines.last_mut().filter(|p| p.line.first_paint_pos() == line.first_paint_pos()) {
-            if !prev.line.text.ends_with(' ') && !line.text.starts_with(' ') {
-                prev.line.text.push(' ');
-            }
-            prev.line.text.push_str(&line.text);
-            prev.line.rect = [
-                prev.line.rect[0].min(line.rect[0]),
-                prev.line.rect[1].min(line.rect[1]),
-                prev.line.rect[2].max(line.rect[2]),
-                prev.line.rect[3].max(line.rect[3]),
-            ];
-            let start = prev.line.ink.len();
-            let rect = line.rect;
-            prev.line.ink.extend(line.ink);
-            prev.segments.push((rect, start..prev.line.ink.len()));
-        } else {
-            let segments = vec![(line.rect, 0..line.ink.len())];
-            lines.push(AuditLine { line, segments });
-        }
-    }
-    Ok(lines)
-}
-
 /// A filled rectangle is a faux-redaction cover for a text line iff it was painted strictly
 /// after the start of the line, overlaps it substantially, and is dark enough against the line's
 /// color to make the text unreadable. Light covers (table shading, highlights) over dark text fail
 /// the contrast check and are not flagged. A line can join runs painted before and after the
 /// cover; the later ones are drawn on it in the same low-contrast color, so they are unreadable
 /// too.
-fn is_cover(rect: &cover::FilledRect, line: &AuditLine) -> bool {
-    rect.pos > line.line.first_paint_pos() && covers(&rect.rect, line) && contrast(line.line.color, rect.rgb) < COVER_CONTRAST
+fn is_cover(rect: &cover::FilledRect, line: &TextLine) -> bool {
+    rect.pos > line.first_paint_pos() && covers(&rect.rect, line) && contrast(line.color, rect.rgb) < COVER_CONTRAST
 }
 
 /// Does `cover` hide a substantial part of what `line` draws? Three ways, any is enough:
@@ -269,24 +247,47 @@ fn is_cover(rect: &cover::FilledRect, line: &AuditLine) -> bool {
 ///   flagged, while a cover over the gap alone, with no word under it, stops counting.
 ///
 /// A line without word boxes is measured on its box alone.
-fn covers(cover: &[f64; 4], line: &AuditLine) -> bool {
-    covers_geometry(cover, &line.line.rect, &line.line.ink)
-        || line.segments.iter().any(|(rect, range)| line.line.ink.get(range.clone()).is_some_and(|ink| covers_geometry(cover, rect, ink)))
-}
-
-fn covers_geometry(cover: &[f64; 4], rect: &[f64; 4], ink: &[[f64; 4]]) -> bool {
+fn covers(cover: &[f64; 4], line: &TextLine) -> bool {
     let hidden = |b: &[f64; 4]| area(&[cover[0].max(b[0]), cover[1].max(b[1]), cover[2].min(b[2]), cover[3].min(b[3])]);
     let fraction = |boxes: &[[f64; 4]]| {
         let total: f64 = boxes.iter().map(area).sum();
         if total > 0.0 { boxes.iter().map(hidden).sum::<f64>() / total } else { 0.0 }
     };
-    if ink.iter().any(|w| area(w) > 0.0 && hidden(w) / area(w) >= WORD_FRACTION) {
+    if line.ink.iter().any(|w| area(w) > 0.0 && hidden(w) / area(w) >= WORD_FRACTION) {
         return true;
     }
-    let inked = fraction(ink) >= COVER_FRACTION;
-    let boxed = fraction(std::slice::from_ref(rect)) >= COVER_FRACTION;
-    let word_intersects = || ink.iter().any(|w| hidden(w) > 0.0);
-    inked || (boxed && (ink.is_empty() || word_intersects()))
+    let inked = fraction(&line.ink) >= COVER_FRACTION;
+    let boxed = fraction(std::slice::from_ref(&line.rect)) >= COVER_FRACTION;
+    let word_intersects = || line.ink.iter().any(|w| hidden(w) > 0.0);
+    inked || (boxed && (line.ink.is_empty() || word_intersects()))
+}
+
+/// Appends the text of `line` that `cover` lies on to `out`: the runs whose words it overlaps
+/// (#4164), so the words of the line painted beside the cover, which stay visible, are not
+/// reported as hidden. Neighbouring runs are joined as the line joins them, so a word split
+/// across runs stays one word; runs with others left out between them are spaced. The whole
+/// line when its runs can't say: a single run, a line whose text was reordered for reading, or
+/// a cover that overlaps the line's box but none of its words.
+fn covered_words(cover: &[f64; 4], line: &TextLine, out: &mut String) {
+    let overlaps = |w: &[f64; 4]| area(&[cover[0].max(w[0]), cover[1].max(w[1]), cover[2].min(w[2]), cover[3].min(w[3])]) > 0.0;
+    let mut words = String::new();
+    let mut last = None;
+    for (i, (text, ink, spaced)) in line.runs().enumerate() {
+        if text.trim().is_empty() || !ink.iter().any(overlaps) {
+            continue;
+        }
+        let apart = last.is_some_and(|l: usize| l.saturating_add(1) != i || spaced);
+        if apart && !words.ends_with(char::is_whitespace) && !text.starts_with(char::is_whitespace) {
+            words.push(' ');
+        }
+        words.push_str(text);
+        last = Some(i);
+    }
+    if line.runs().nth(1).is_none() || last.is_none() {
+        out.push_str(line.text.trim());
+    } else {
+        out.push_str(words.trim());
+    }
 }
 
 /// The area of a rectangle, 0 when it is empty or inverted.

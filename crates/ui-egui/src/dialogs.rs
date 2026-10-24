@@ -1407,7 +1407,6 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
         app.boxes_draft.seeded = None;
     }
     if protect_now && app.apply_edit(app.protect_draft.edit()) {
-        app.protect_draft = Default::default();
         app.notify_tr("Password protection will be applied when you save");
     }
     if apply_number && let Some(edit) = number_now {
@@ -1426,6 +1425,8 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
         app.props_draft = None;
         app.view_draft = None;
         app.bulk_field_props = None;
+        app.protect_draft = Default::default();
+        app.sign_draft = None;
     } else {
         app.dialog = Some(next);
     }
@@ -1825,7 +1826,7 @@ fn password(app: &mut PdfCraftApp, ctx: &egui::Context) {
     let message = crate::i18n::fmt(tl!("“{name}” is protected. Enter a password to open it."), &[("name", &prompt.name)]);
     match password_modal(ctx, "password", tl!("Password required"), message, &mut prompt.input, prompt.error.as_deref(), tl!("Open")) {
         Some(PasswordAnswer::Submit) => {
-            let pw = prompt.input.clone();
+            let pw = std::mem::take(&mut prompt.input);
             app.submit_password(Some(pw));
         }
         Some(PasswordAnswer::Cancel) => app.submit_password(None),
@@ -1840,7 +1841,7 @@ fn unlock(app: &mut PdfCraftApp, ctx: &egui::Context) {
         crate::i18n::fmt(tl!("“{name}” has security restrictions. Enter its permissions password to lift them."), &[("name", &prompt.name)]);
     match password_modal(ctx, "unlock", tl!("Permissions password"), message, &mut prompt.input, prompt.error.as_deref(), tl!("Unlock")) {
         Some(PasswordAnswer::Submit) => {
-            let pw = prompt.input.clone();
+            let pw = std::mem::take(&mut prompt.input);
             app.submit_unlock(Some(pw));
         }
         Some(PasswordAnswer::Cancel) => app.submit_unlock(None),

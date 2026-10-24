@@ -370,7 +370,7 @@ impl XHost {
         match e {
             XfaEffect::MessageBox(m) => XfaEffect::MessageBox(clip(m)),
             XfaEffect::LaunchUrl(u) => XfaEffect::LaunchUrl(clip(u)),
-<<<<<<< HEAD
+            XfaEffect::SetFocus(s) => XfaEffect::SetFocus(clip(s)),
             XfaEffect::ResetData(mut names) => {
                 names.truncate(MAX_EFFECTS);
                 for n in &mut names {
@@ -378,10 +378,6 @@ impl XHost {
                 }
                 XfaEffect::ResetData(names)
             }
-=======
-            XfaEffect::SetFocus(s) => XfaEffect::SetFocus(clip(s)),
-            XfaEffect::ResetData(names) => XfaEffect::ResetData(names.into_iter().map(clip).collect()),
->>>>>>> upstream/main
             XfaEffect::SetValue { som, value } => {
                 let (value, cut) = clip_value(value);
                 if cut {
@@ -431,12 +427,8 @@ impl XHost {
     pub(crate) fn print(&mut self, line: String) {
         if self.console.len() >= MAX_CONSOLE || self.console_bytes.saturating_add(line.len()) > crate::MAX_HOST_BYTES {
             self.dropped_console += 1;
-<<<<<<< HEAD
-        } else {
-            self.console_bytes = self.console_bytes.saturating_add(line.len());
-=======
         } else if self.room(line.len()) {
->>>>>>> upstream/main
+            self.console_bytes = self.console_bytes.saturating_add(line.len());
             self.console.push(line);
         }
     }

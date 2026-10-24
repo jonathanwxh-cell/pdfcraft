@@ -2855,6 +2855,26 @@ fn open_scripts_collect_catalog_next_chains_and_opening_page_actions() {
     assert_eq!(open_scripts(&dest_array), ["page2();"]);
 }
 
+/// Catalog and opening-page actions share the form's stream budget, including repeated streams
+/// inside each /Next chain. Literal scripts still work after the stream allowance is spent.
+#[test]
+fn open_script_chains_share_one_decode_budget() {
+    let next = "<< /S /JavaScript /JS 6 0 R >> ".repeat(39);
+    let mut doc = document(&[
+        "<< /Type /Catalog /Pages 2 0 R /OpenAction 4 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /AA << /O 5 0 R >> >>".into(),
+        format!("<< /S /JavaScript /JS 6 0 R /Next [{next}] >>"),
+        format!("<< /S /JavaScript /JS 6 0 R /Next [{next} << /S /JavaScript /JS (after_streams();) >>] >>"),
+        "null".into(),
+    ]);
+    doc.set(ObjRef::new(6, 0), Object::Stream(pdfcraft_cos::Stream::flate(Dict::new(), &vec![b'x'; 1 << 20])));
+    let scripts = open_scripts(&doc);
+    assert_eq!(scripts.len(), 65, "64 stream scripts followed by one literal");
+    assert_eq!(scripts.iter().take(64).map(String::len).sum::<usize>(), MAX_SCRIPT_BYTES);
+    assert_eq!(scripts.last().map(String::as_str), Some("after_streams();"));
+}
+
 /// #3470: a form whose writer left the appearances to the viewer. Field A has an empty one,
 /// B none, C its own (`(old C)`), D is a combo without one, E a check box with states, F a list
 /// box without one, and G only a down appearance (`/D`, no `/N`).

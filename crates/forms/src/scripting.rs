@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use pdfcraft_cos::{Document, ObjRef, Object, PdfString};
+use pdfcraft_cos::{DecodeBudget, Document, ObjRef, Object, PdfString};
 
 use crate::{Field, FieldKind, FieldValue, FormError, fields, flags};
 
@@ -216,15 +216,16 @@ pub fn document_scripts_named(doc: &Document) -> Vec<(String, String)> {
 
 /// Document-open JavaScripts: the catalog's `/OpenAction` (and its `/Next` chain) followed by the
 /// opening page's `/AA /O` action (and its `/Next` chain), in execution order (ISO 32000-2
-/// §7.7.2, §12.6.2, §12.6.3).
+/// §7.7.2, §12.6.2, §12.6.3). Both action chains share one script-stream decode budget.
 pub fn open_scripts(doc: &Document) -> Vec<String> {
     let Some(root) = doc.root() else { return Vec::new() };
     let cat = doc.get(root);
     let Some(c) = cat.as_dict() else { return Vec::new() };
     let mut out = Vec::new();
+    let mut scripts = crate::script_budget();
     let open = c.get(b"OpenAction");
     if let Some(a) = open {
-        collect_action_scripts(doc, a, &mut out);
+        collect_action_scripts(doc, a, &mut out, &mut scripts);
     }
     let pages = crate::page_refs(doc);
     let dest = open.map(|o| doc.resolve(o)).and_then(|o| match &*o {
@@ -244,12 +245,12 @@ pub fn open_scripts(doc: &Document) -> Vec<String> {
         && let Some(page_open) =
             doc.get(page).as_dict().and_then(|d| d.get(b"AA")).map(|a| doc.resolve(a)).and_then(|a| a.as_dict().and_then(|aa| aa.get(b"O").cloned()))
     {
-        collect_action_scripts(doc, &page_open, &mut out);
+        collect_action_scripts(doc, &page_open, &mut out, &mut scripts);
     }
     out
 }
 
-fn collect_action_scripts(doc: &Document, root: &Object, out: &mut Vec<String>) {
+fn collect_action_scripts(doc: &Document, root: &Object, out: &mut Vec<String>, scripts: &mut DecodeBudget) {
     let mut stack = vec![root.clone()];
     let mut seen: HashSet<ObjRef> = HashSet::new();
     let mut visited = 0;
@@ -270,7 +271,7 @@ fn collect_action_scripts(doc: &Document, root: &Object, out: &mut Vec<String>) 
         }
         let Some(d) = node.as_dict() else { continue };
         if d.name(b"S") == Some(b"JavaScript")
-            && let Some(js) = crate::script(doc, &raw)
+            && let Some(js) = crate::script(doc, &raw, scripts)
             && !js.trim().is_empty()
         {
             out.push(js);

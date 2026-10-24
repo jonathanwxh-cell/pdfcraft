@@ -14,7 +14,7 @@ fn collected(src: &[u8]) -> Vec<String> {
     let res = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
     let mut rep = Report::default();
     let rects = [[-1_000_000.0, -1_000_000.0, 1_000_000.0, 1_000_000.0]];
-    let mut scope = Scope::new(&rects, Mode::Apply, &mut rep);
+    let mut scope = Scope::new(&rects, Mode::Apply, &mut rep, pdfcraft_cos::DecodeBudget::page());
     process(&mut doc, &mut scope, &data, &res, pdfcraft_content::Matrix::IDENTITY);
     scope.flush_run();
     scope.removed_fragments

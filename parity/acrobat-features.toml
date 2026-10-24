@@ -310,7 +310,7 @@ milestone = "M1"
 status = "shipped"
 commands = ["file.save_as"]
 tools = ["doc_save"]
-evidence = ["crates/cos/tests/writer.rs::full_save_packs_objects_into_object_streams", "crates/cos/tests/writer.rs::qpdf_accepts_object_stream_output", "crates/cos/tests/writer.rs::objects_referenced_by_the_encrypt_dictionary_stay_outside_object_streams"]
+evidence = ["crates/cos/tests/it/writer.rs::full_save_packs_objects_into_object_streams", "crates/cos/tests/writer.rs::qpdf_accepts_object_stream_output", "crates/cos/tests/writer.rs::objects_referenced_by_the_encrypt_dictionary_stay_outside_object_streams"]
 notes = ""
 
 [[feature]]
@@ -7265,7 +7265,7 @@ milestone = "M11"
 status = "shipped"
 commands = ["optimize.reduce"]
 tools = ["doc_reduce"]
-evidence = ["crates/ui-egui/tests/create.rs::reduce_file_size_writes_a_compact_copy", "crates/ui-egui/tests/create.rs::reduce_file_size_saves_nothing_when_the_file_is_already_small", "crates/engine/src/tests.rs::create_and_reduce", "crates/automation/tests/automation.rs::creating_and_reducing_through_tools", "crates/automation/tests/automation.rs::optimizing_through_tools", "crates/optimize/tests/optimize.rs::an_identity_decode_array_does_not_stop_reduce"]
+evidence = ["crates/ui-egui/tests/create.rs::reduce_file_size_writes_a_compact_copy", "crates/ui-egui/tests/create.rs::reduce_file_size_saves_nothing_when_the_file_is_already_small", "crates/engine/src/tests.rs::create_and_reduce", "crates/automation/tests/automation.rs::creating_and_reducing_through_tools", "crates/automation/tests/it/automation.rs::optimizing_through_tools", "crates/optimize/tests/optimize.rs::an_identity_decode_array_does_not_stop_reduce"]
 notes = "images above 225 ppi to 150 ppi JPEG medium (after merging page pictures printed as one-pixel strips into one image), thumbnails dropped, resources merged, object streams; scanner images with the default decode array are included; a copy that isn't smaller is not saved (\"already as small as it can be made\"); runs in the background with a progress bar and Cancel"
 
 [[feature]]
@@ -7277,7 +7277,7 @@ milestone = "M11"
 status = "partial"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/optimize/tests/optimize.rs::compatibility_level_sets_version_unpacks_for_1_4_and_checks_encryption", "crates/automation/tests/automation.rs::optimizing_through_tools", "crates/ui-egui/tests/create.rs::the_pdf_optimizer_dialog_picks_a_preset"]
+evidence = ["crates/optimize/tests/optimize.rs::compatibility_level_sets_version_unpacks_for_1_4_and_checks_encryption", "crates/automation/tests/it/automation.rs::optimizing_through_tools", "crates/ui-egui/tests/it/create.rs::the_pdf_optimizer_dialog_picks_a_preset"]
 notes = "Retain existing (default), PDF 1.4, 1.5, 1.6, 1.7 or 2.0 in PDF Optimizer and doc_optimize; writes the chosen %PDF- header, clears any overriding catalog /Version, disables and unpacks object streams and cross-reference streams for PDF 1.4, and refuses when the document's encryption requires a newer PDF version (#3090). Partial compatibility only: content newer than the target is neither detected nor converted (including optional content, JPX images, 16-bit images, OpenType fonts and PDF 2.0 features); the chosen header does not guarantee compatibility with older readers"
 
 [[feature]]
@@ -7289,7 +7289,7 @@ milestone = "M11"
 status = "partial"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/automation/tests/optimize_content_boundaries.rs::fragment_merge_preserves_a_comment_across_content_pieces", "crates/ui-egui/tests/create.rs::the_pdf_optimizer_dialog_saves_an_optimized_copy", "crates/automation/tests/automation.rs::optimizing_through_tools", "crates/ui-egui/src/optimize_ui.rs::the_progress_card_shows_the_stage_and_cancels", "crates/engine/src/tests.rs::an_optimize_job_reports_its_stages_and_can_be_cancelled", "crates/optimize/tests/optimize.rs::images_and_forms_nothing_draws_are_dropped", "crates/automation/tests/automation.rs::a_deleted_image_is_not_kept_by_reduce_or_optimize", "crates/ui-egui/tests/create.rs::the_pdf_optimizer_dialog_picks_a_preset", "crates/automation/tests/automation.rs::a_page_printed_in_strips_gets_small_through_tools", "crates/optimize/tests/optimize.rs::the_mobile_preset_makes_a_printed_page_small"]
+evidence = ["crates/automation/tests/optimize_content_boundaries.rs::fragment_merge_preserves_a_comment_across_content_pieces", "crates/ui-egui/tests/create.rs::the_pdf_optimizer_dialog_saves_an_optimized_copy", "crates/automation/tests/it/automation.rs::optimizing_through_tools", "crates/ui-egui/src/optimize_ui.rs::the_progress_card_shows_the_stage_and_cancels", "crates/engine/src/tests.rs::an_optimize_job_reports_its_stages_and_can_be_cancelled", "crates/optimize/tests/optimize.rs::images_and_forms_nothing_draws_are_dropped", "crates/automation/tests/automation.rs::a_deleted_image_is_not_kept_by_reduce_or_optimize", "crates/ui-egui/tests/it/create.rs::the_pdf_optimizer_dialog_picks_a_preset", "crates/automation/tests/automation.rs::a_page_printed_in_strips_gets_small_through_tools", "crates/optimize/tests/optimize.rs::the_mobile_preset_makes_a_printed_page_small"]
 notes = "Settings menu with the Standard and Mobile presets (Custom once an option changes; doc_optimize preset), Images (with Merge image fragments: a page picture drawn as one-pixel strips, as some PDF printers write it, is put back together so it can be resampled), Discard Objects, Discard User Data, Clean Up (also drops images and forms the pages list but never draw, such as deleted images); runs in the background with a progress bar (per image) and Cancel; no Fonts or Transparency panels, no saved custom presets, no space audit"
 
 [[feature]]
@@ -7301,7 +7301,7 @@ milestone = "M11"
 status = "partial"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/optimize/tests/optimize.rs::images_are_measured_where_drawn_and_downsampled", "crates/optimize/tests/optimize.rs::settings_choose_what_happens", "crates/automation/tests/automation.rs::optimizing_through_tools", "crates/optimize/tests/optimize.rs::a_page_picture_printed_as_one_pixel_strips_is_merged_into_one_image", "crates/optimize/tests/optimize.rs::images_that_do_not_tile_a_picture_are_left_alone", "crates/optimize/tests/optimize.rs::a_deeply_nested_form_is_measured_at_its_largest_use", "crates/optimize/tests/optimize.rs::images_are_not_resampled_when_some_uses_could_not_be_measured"]
+evidence = ["crates/optimize/tests/optimize.rs::images_are_measured_where_drawn_and_downsampled", "crates/optimize/tests/optimize.rs::settings_choose_what_happens", "crates/automation/tests/it/automation.rs::optimizing_through_tools", "crates/optimize/tests/optimize.rs::a_page_picture_printed_as_one_pixel_strips_is_merged_into_one_image", "crates/optimize/tests/optimize.rs::images_that_do_not_tile_a_picture_are_left_alone", "crates/optimize/tests/optimize.rs::a_deeply_nested_form_is_measured_at_its_largest_use", "crates/optimize/tests/optimize.rs::images_are_not_resampled_when_some_uses_could_not_be_measured"]
 notes = "colour and grayscale, bicubic, effective resolution measured where drawn (every use, through nested forms up to 12 deep; when a use can't be measured, nothing is resampled); image fragments stacked edge to edge are merged first (side-by-side tiles not yet); monochrome not yet"
 
 [[feature]]
@@ -7373,7 +7373,7 @@ milestone = "M11"
 status = "shipped"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/automation.rs::optimizing_through_tools"]
+evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/it/automation.rs::optimizing_through_tools"]
 notes = "with links and actions (Remove Hidden Information)"
 
 [[feature]]
@@ -7409,7 +7409,7 @@ milestone = "M11"
 status = "shipped"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/automation.rs::optimizing_through_tools"]
+evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/it/automation.rs::optimizing_through_tools"]
 notes = ""
 
 [[feature]]
@@ -7469,7 +7469,7 @@ milestone = "M11"
 status = "shipped"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/automation.rs::optimizing_through_tools"]
+evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/it/automation.rs::optimizing_through_tools"]
 notes = ""
 
 [[feature]]
@@ -7481,7 +7481,7 @@ milestone = "M11"
 status = "shipped"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/automation.rs::optimizing_through_tools"]
+evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/it/automation.rs::optimizing_through_tools"]
 notes = ""
 
 [[feature]]
@@ -7493,7 +7493,7 @@ milestone = "M11"
 status = "shipped"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/automation/tests/automation.rs::optimizing_through_tools", "crates/ui-egui/tests/create.rs::the_pdf_optimizer_dialog_saves_an_optimized_copy"]
+evidence = ["crates/automation/tests/it/automation.rs::optimizing_through_tools", "crates/ui-egui/tests/create.rs::the_pdf_optimizer_dialog_saves_an_optimized_copy"]
 notes = ""
 
 [[feature]]
@@ -7505,7 +7505,7 @@ milestone = "M11"
 status = "shipped"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/automation.rs::optimizing_through_tools"]
+evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/it/automation.rs::optimizing_through_tools"]
 notes = ""
 
 [[feature]]
@@ -7517,7 +7517,7 @@ milestone = "M11"
 status = "shipped"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/automation.rs::optimizing_through_tools"]
+evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/it/automation.rs::optimizing_through_tools"]
 notes = ""
 
 [[feature]]
@@ -7541,7 +7541,7 @@ milestone = "M11"
 status = "partial"
 commands = ["optimize.advanced"]
 tools = ["doc_optimize"]
-evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/automation.rs::optimizing_through_tools"]
+evidence = ["crates/redact/src/tests.rs::hidden_information_is_counted_and_removed", "crates/automation/tests/it/automation.rs::optimizing_through_tools"]
 notes = "hidden layer content removed; visible layers not flattened"
 
 [[feature]]
@@ -7577,7 +7577,7 @@ milestone = "M11"
 status = "shipped"
 commands = ["file.save_as", "optimize.advanced"]
 tools = ["doc_save", "doc_optimize"]
-evidence = ["crates/cos/tests/writer.rs::full_save_packs_objects_into_object_streams", "crates/optimize/tests/optimize.rs::compatibility_level_sets_version_unpacks_for_1_4_and_checks_encryption", "crates/automation/tests/automation.rs::optimizing_through_tools", "crates/ui-egui/tests/create.rs::the_pdf_optimizer_dialog_picks_a_preset"]
+evidence = ["crates/cos/tests/it/writer.rs::full_save_packs_objects_into_object_streams", "crates/optimize/tests/optimize.rs::compatibility_level_sets_version_unpacks_for_1_4_and_checks_encryption", "crates/automation/tests/it/automation.rs::optimizing_through_tools", "crates/ui-egui/tests/it/create.rs::the_pdf_optimizer_dialog_picks_a_preset"]
 notes = "on by default for full saves and in PDF Optimizer ▸ Clean Up (and doc_optimize object_streams); turning it off or targeting PDF 1.4 unpacks object streams into standalone objects with a classic cross-reference table"
 
 [[feature]]

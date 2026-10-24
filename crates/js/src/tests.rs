@@ -1865,7 +1865,7 @@ fn check_sandbox_hardening_cases() {
         assert!(o.error.is_some(), "should cap host string bytes for {script}: {o:?}");
         assert!(o.requests.is_empty() && o.changed.is_empty(), "{script}: {o:?}");
     }
-    let o = go("this.resetForm(new Array(4096).fill('x'.repeat(2048)))", &Event::field("Calculate", "total", ""));
+    let o = go("this.resetForm(new Array(9000).fill('x'.repeat(4096)))", &Event::field("Calculate", "total", ""));
     assert!(o.requests.is_empty(), "oversized resetForm payload is dropped: {o:?}");
 
     // AcroForm Outcome vectors (alerts, console, requests) are capped by count and line length.

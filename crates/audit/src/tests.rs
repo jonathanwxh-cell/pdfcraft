@@ -660,7 +660,7 @@ fn indirect_subtype_is_resolved() {
 fn later_text_on_the_line_does_not_clear_an_earlier_cover() {
     let content = b"0 g\nBT /F1 24 Tf 100 700 Td (SECRET) Tj ET\n98 688 94 32 re f\nBT /F1 24 Tf 200 700 Td (tail) Tj ET\n";
     let doc = open(one_page(content, ""));
-    let lines = pdfcraft_edit::text_lines(&doc, 0).expect("text");
+    let lines = crate::audit_lines(&doc, 0, &pdfcraft_model::pages(&doc)[0]).expect("text");
     assert_eq!(lines.len(), 1, "the runs join one line: {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
     let findings = audit_redactions(&doc).expect("audit must run");
     assert_eq!(findings.len(), 1, "{findings:?}");
@@ -787,7 +787,7 @@ fn copy_restricted_documents_withhold_covered_text() {
 fn withheld_covered_text_is_not_assembled() {
     const PAGE: [f64; 4] = [0.0, 0.0, 612.0, 792.0];
     let doc = open(one_page(b"BT /F1 24 Tf 100 700 Td (SECRET DATA 123) Tj ET\n", ""));
-    let lines = pdfcraft_edit::text_lines(&doc, 0).expect("text");
+    let lines = crate::audit_lines(&doc, 0, &pdfcraft_model::pages(&doc)[0]).expect("text");
     let mut budget = crate::Budget { limits: crate::Limits::DEFAULT, comparisons: 0, page_cost: 0, covered_text: 0 };
     budget.start_page(&lines);
     let withheld = budget.hidden_text(&lines, false, &PAGE, |_| true).expect("within the budget");

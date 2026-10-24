@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use pdfcraft_content::{Matrix, Op, Pieces, contains, num, overlaps, serialize_ops, string};
-use pdfcraft_cos::{CosError, Dict, Document, ObjRef, Object, Stream};
+use pdfcraft_cos::{CosError, DecodeBudget, Dict, Document, MAX_PAGE_FORMS, ObjRef, Object, Stream};
 
 use crate::{RedactError, Report, image, page_streams, tags};
 use pdfcraft_fonts::pdf::Metrics;
@@ -90,6 +90,10 @@ pub(crate) struct Output {
     /// Apply mode met vertical-writing text (which it cannot remove) while a redaction region was
     /// in force: the operation must fail closed rather than leave that text under the mark.
     pub vertical: bool,
+    /// The content holds an inline image the renderer reads no image for
+    /// ([`pdfcraft_content::Parsed::ambiguous_images`]): what this scope placed after it may not
+    /// be what the page shows, so a redaction must not trust it.
+    pub ambiguous: bool,
     pub tag_changes: Vec<(ObjRef, ObjRef, HashSet<i64>, HashSet<i64>)>,
     pub error: Option<CosError>,
 }
@@ -164,10 +168,16 @@ pub(crate) struct Scope<'a> {
     fonts: HashMap<Vec<u8>, Rc<Metrics>>,
     used_names: Vec<Vec<u8>>,
     depth: usize,
+    /// Form entries and decoded bytes left for this page, its content streams already charged:
+    /// shared forms drawn from other shared forms would otherwise multiply the work with every
+    /// level.
+    budget: DecodeBudget,
 }
 
 impl<'a> Scope<'a> {
-    pub fn new(rects: &'a [[f64; 4]], mode: Mode, report: &'a mut Report) -> Self {
+    /// A scope whose form walk spends `budget`, what is left of the page's allowance after its
+    /// content streams were decoded.
+    pub fn new(rects: &'a [[f64; 4]], mode: Mode, report: &'a mut Report, budget: DecodeBudget) -> Self {
         Scope {
             rects,
             mode,
@@ -182,6 +192,7 @@ impl<'a> Scope<'a> {
             fonts: HashMap::new(),
             used_names: Vec::new(),
             depth: 0,
+            budget,
         }
     }
 
@@ -466,7 +477,7 @@ pub(crate) fn prune(xo: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>]) {
     }
     let joined = Pieces::join(content);
     let ops = joined.parse().ops;
-    let still_drawn = |n: &[u8]| ops.iter().any(|op| op.is("Do") && op.name(0) == Some(n));
+    let still_drawn = |n: &[u8]| ops.iter().any(|op| op.is("Do") && op.last_name() == Some(n));
     for n in replaced {
         if !still_drawn(n) {
             xo.remove(n);
@@ -534,7 +545,7 @@ fn content_draws(doc: &Document, content: &[Vec<u8>], xo: &Dict, name: &[u8], de
     let joined = Pieces::join(content);
     let ops = joined.parse().ops;
     for op in ops.iter().filter(|op| op.is("Do")) {
-        let Some(n) = op.name(0) else { continue };
+        let Some(n) = op.last_name() else { continue };
         if n == name {
             return Some(true);
         }
@@ -547,8 +558,8 @@ fn content_draws(doc: &Document, content: &[Vec<u8>], xo: &Dict, name: &[u8], de
         if depth >= MAX_DEPTH {
             return None;
         }
-        let Ok(data) = s.decoded() else { return None };
-        match content_draws(doc, std::slice::from_ref(&data), xo, name, depth + 1, seen) {
+        let Ok(_data) = s.decoded() else { return None };
+        match content_draws(doc, content, xo, name, depth + 1, seen) {
             Some(false) => {}
             other => return other,
         }
@@ -693,8 +704,9 @@ pub(crate) fn unlink_doomed(doc: &mut Document, doomed: &[ObjRef], retired_prope
         }
     }
     // A surviving form can own the same old resource dictionary as a rewritten page. Its
-    // unused descriptions remain reachable too, even after every page holder is cleaned.
-    unlink_form_properties(doc, &holder_nodes, retired_properties)?;
+    // unused descriptions and doomed XObjects remain reachable too, even after every page
+    // holder is cleaned.
+    unlink_from_forms(doc, &holder_nodes, &doomed, retired_properties)?;
     Ok(())
 }
 
@@ -731,8 +743,11 @@ fn prune_retired_properties(doc: &Document, res: &mut Dict, names: &[Vec<u8>], c
     Ok(pruned)
 }
 
-fn unlink_form_properties(doc: &mut Document, holders: &[ObjRef], retired: &[Object]) -> Result<(), CosError> {
-    if retired.is_empty() {
+/// Unlink retired properties and `doomed` XObjects from the resources of the forms reachable from
+/// the page-tree `holders`, each unless the form's own content (or a form inheriting its
+/// resources) still uses the name. Fails closed when that cannot be determined.
+fn unlink_from_forms(doc: &mut Document, holders: &[ObjRef], doomed: &HashSet<ObjRef>, retired: &[Object]) -> Result<(), CosError> {
+    if retired.is_empty() && doomed.is_empty() {
         return Ok(());
     }
     let mut pending: Vec<Dict> = holders
@@ -757,13 +772,38 @@ fn unlink_form_properties(doc: &mut Document, holders: &[ObjRef], retired: &[Obj
             let Some(mut res) = form.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()) else { continue };
             let names: Vec<Vec<u8>> =
                 res_dict(doc, &res, b"Properties").iter().filter(|(_, value)| retired.contains(value)).map(|(name, _)| name.to_vec()).collect();
-            if !names.is_empty() && prune_retired_properties(doc, &mut res, &names, &[vec![form.decoded()?]])? {
+            let mut xo = res_dict(doc, &res, b"XObject");
+            let doomed_names: Vec<Vec<u8>> =
+                xo.iter().filter(|(_, v)| v.as_ref().is_some_and(|r| doomed.contains(&r))).map(|(n, _)| n.to_vec()).collect();
+            if names.is_empty() && doomed_names.is_empty() {
+                pending.push(res);
+                continue;
+            }
+            let data = form.decoded()?;
+            let mut pruned = prune_doomed_xobjects(doc, std::slice::from_ref(&data), &mut xo, &doomed_names)?;
+            if pruned {
+                res.set(b"XObject".to_vec(), Object::Dict(xo));
+            }
+            pruned |= prune_retired_properties(doc, &mut res, &names, &[vec![data]])?;
+            if pruned {
                 doc.update_dict(reference, |d| d.set(b"Resources".to_vec(), Object::Dict(res.clone())))?;
             }
             pending.push(res);
         }
     }
     Ok(())
+}
+
+fn prune_doomed_xobjects(doc: &Document, content: &[Vec<u8>], xo: &mut Dict, doomed_names: &[Vec<u8>]) -> Result<bool, CosError> {
+    let mut pruned = false;
+    for name in doomed_names {
+        match content_draws(doc, content, xo, name, 0, &mut HashSet::new()) {
+            Some(true) => {}
+            Some(false) => pruned |= xo.remove(name).is_some(),
+            None => return Err(CosError::Syntax { offset: 0, detail: "redaction could not fully inspect shared form resources".into() }),
+        }
+    }
+    Ok(pruned)
 }
 
 /// The clip that hides everything inside each region: one even-odd clip per region (a big
@@ -803,7 +843,7 @@ fn resource_ops(doc: &Document, res: &Dict, content: &[Vec<u8>]) -> Result<Vec<O
     while cursor < ops.len() {
         let op = &ops[cursor];
         let nested = if op.is("Do") {
-            op.name(0).and_then(|n| xobjects.get(n)).and_then(Object::as_ref)
+            op.last_name().and_then(|n| xobjects.get(n)).and_then(Object::as_ref)
         } else if matches!(op.op.as_slice(), b"scn" | b"SCN") {
             op.operands.last().and_then(Object::as_name).and_then(|n| patterns.get(n)).and_then(Object::as_ref)
         } else if op.is("gs") {
@@ -860,7 +900,7 @@ fn prune_form_resources(doc: &Document, res: &mut Dict, content: &[Vec<u8>]) -> 
     let mut xo = res_dict(doc, res, b"XObject");
     let names: Vec<Vec<u8>> = xo.iter().map(|(n, _)| n.to_vec()).collect();
     for name in names {
-        if !ops.iter().any(|op| op.is("Do") && op.name(0) == Some(&name)) {
+        if !ops.iter().any(|op| op.is("Do") && op.last_name() == Some(&name)) {
             xo.remove(&name);
         }
     }
@@ -896,6 +936,34 @@ fn prune_form_resources(doc: &Document, res: &mut Dict, content: &[Vec<u8>]) -> 
     Ok(())
 }
 
+/// The font, writing direction and size an ExtGState's `/Font [font size]` entry sets, as `Tf`
+/// would (ISO 32000-2 §8.4.5); `None` when `name` sets no font. The metrics are cached with the
+/// fonts `Tf` names, under a key no resource name can take (a name cannot hold a null byte).
+fn extgstate_font(
+    doc: &Document,
+    scope: &mut Scope<'_>,
+    ext_gstates: &Dict,
+    name: &[u8],
+    fallback: &Rc<Metrics>,
+) -> Option<(Rc<Metrics>, bool, f64)> {
+    let state = doc.resolve(ext_gstates.get(name)?).as_dict().cloned()?;
+    let entry = doc.resolve(state.get(b"Font")?).as_array().cloned()?;
+    let [font, size] = entry.as_slice() else { return None };
+    let size = doc.resolve(size).as_f64()?;
+    let font_dict = doc.resolve(font).as_dict().cloned();
+    let vertical = font_dict.as_ref().is_some_and(|d| is_vertical(doc, d));
+    let key = [b"\0".as_slice(), name].concat();
+    let metrics = match scope.fonts.get(&key) {
+        Some(m) => m.clone(),
+        None => {
+            let m = font_dict.as_ref().map(|d| Rc::new(Metrics::from_dict(doc, d))).unwrap_or_else(|| fallback.clone());
+            scope.fonts.insert(key, m.clone());
+            m
+        }
+    };
+    Some((metrics, vertical, size))
+}
+
 /// One glyph of a shown string.
 struct Glyph {
     bytes: std::ops::Range<usize>,
@@ -906,11 +974,9 @@ struct Glyph {
 
 /// Process a scope's content streams (state flows from one stream to the next).
 pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], resources: &Dict, ctm: Matrix) -> Output {
-    let mut out = Output::default();
-    let fallback = Rc::new(Metrics::fallback());
-    let mut gs = Gs {
+    let gs = Gs {
         ctm,
-        font: fallback.clone(),
+        font: Rc::new(Metrics::fallback()),
         vertical: false,
         size: 0.0,
         char_spacing: 0.0,
@@ -923,6 +989,16 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
         fill_pattern: None,
         stroke_pattern: None,
     };
+    process_from(doc, scope, streams, resources, gs)
+}
+
+/// [`process`] from graphics state `gs`: a form XObject starts with its caller's, text state
+/// included (ISO 32000-2 §8.10.1), so text it shows without setting a font of its own is placed
+/// with the caller's font, size and spacing, as the renderer places it.
+fn process_from(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], resources: &Dict, mut gs: Gs) -> Output {
+    let mut out = Output::default();
+    let initial_ctm = gs.ctm;
+    let fallback = Rc::new(Metrics::fallback());
     let mut stack: Vec<Gs> = Vec::new();
     let (mut tm, mut tlm) = (Matrix::IDENTITY, Matrix::IDENTITY);
     let fonts_res = res_dict(doc, resources, b"Font");
@@ -944,6 +1020,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
     // next. Parse them joined, then give each operator back to the piece its keyword is in.
     let joined = Pieces::join(streams);
     let mut parsed = joined.parse();
+    out.ambiguous = parsed.ambiguous_images > 0;
     // A rewritten piece loses its comments, so keep where they began and ended: a comment that
     // ran on into the next piece still hides that piece's first line.
     let comment_edges = joined.comment_edges(&parsed);
@@ -1123,7 +1200,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                         } else {
                             gs.stroke_pattern = Some(pat_name);
                         }
-                        if let Some(new) = pattern_op(doc, scope, &op, (&gs.ctm, &ctm), resources, &mut patterns, &mut out) {
+                        if let Some(new) = pattern_op(doc, scope, &op, (&gs, &initial_ctm), resources, &mut patterns, &mut out) {
                             changed = true;
                             if let Some(n) = new {
                                 let updated = n.operands.last().and_then(Object::as_name).map(<[u8]>::to_vec);
@@ -1501,7 +1578,7 @@ fn sanitize_stream_form(
     doc: &mut Document,
     scope: &mut Scope<'_>,
     (r, s): (ObjRef, &Stream),
-    fctm: Matrix,
+    gs: Gs,
     override_rects: Option<&[[f64; 4]]>,
     resources: &Dict,
     out: &mut Output,
@@ -1521,7 +1598,7 @@ fn sanitize_stream_form(
     let active_rects = override_rects.unwrap_or(scope.rects);
     if let Some(bb) = bbox
         && !scope.everywhere()
-        && !active_rects.iter().any(|rect| overlaps(*rect, fctm.bbox(bb), 0.0))
+        && !active_rects.iter().any(|rect| overlaps(*rect, gs.ctm.bbox(bb), 0.0))
     {
         return StreamOutcome::Unchanged;
     }
@@ -1536,8 +1613,26 @@ fn sanitize_stream_form(
         out.doomed.push(r);
         return StreamOutcome::Removed;
     }
-    let data = match s.decoded() {
+    // Strict, like page content: a Form read only in part counts as undecodable.
+    let data = if scope.budget.enter_form() {
+        scope.budget.decode_strict(s)
+    } else {
+        Err(CosError::Filter(format!("the page draws more than {MAX_PAGE_FORMS} form XObjects")))
+    };
+    let data = match data {
         Ok(d) => d,
+        // Past the page's budget nothing more is read: apply refuses the page, and
+        // verification counts the form as content that may remain.
+        Err(e) if scope.budget.exhausted() => {
+            if scope.mode == Mode::Apply {
+                out.error = Some(e);
+            } else if scope.everywhere() {
+                scope.layer_blocks += 1;
+            } else {
+                out.residue += 1;
+            }
+            return StreamOutcome::Unchanged;
+        }
         Err(_) if scope.mode == Mode::Apply => {
             scope.report.forms_removed += 1;
             out.doomed.push(r);
@@ -1567,18 +1662,21 @@ fn sanitize_stream_form(
             fonts: HashMap::new(),
             used_names: std::mem::take(&mut scope.used_names),
             depth: scope.depth + 1,
+            budget: std::mem::replace(&mut scope.budget, DecodeBudget::page()),
         };
-        let res_inner = process(doc, &mut sub_scope, std::slice::from_ref(&data), &res, fctm);
+        let res_inner = process_from(doc, &mut sub_scope, std::slice::from_ref(&data), &res, gs);
         scope.hidden_layers = sub_scope.hidden_layers;
         scope.retained_off_layers = sub_scope.retained_off_layers;
         scope.ocmd_cache = sub_scope.ocmd_cache;
         scope.xobject_oc_cache = sub_scope.xobject_oc_cache;
         scope.layer_blocks = sub_scope.layer_blocks;
         scope.used_names = sub_scope.used_names;
+        scope.budget = sub_scope.budget;
         res_inner
     };
     out.residue += inner.residue;
     out.vertical |= inner.vertical;
+    out.ambiguous |= inner.ambiguous;
     out.doomed.extend_from_slice(&inner.doomed);
     out.retired_properties.extend(inner.retired_properties.clone());
     out.tag_changes.extend(inner.tag_changes.clone());
@@ -1639,15 +1737,8 @@ fn extgstate_op(
     let gs_val = ext_gstates.get(&name)?.clone();
     let gs_ref = gs_val.as_ref();
     let d = doc.resolve(&gs_val).as_dict()?.clone();
-    if let Some(font_arr) = d.get(b"Font").and_then(|f| doc.resolve(f).as_array().cloned())
-        && font_arr.len() >= 2
-    {
-        if let Some(size) = doc.resolve(&font_arr[1]).as_f64() {
-            gs.size = size;
-        }
-        let font_dict = doc.resolve(&font_arr[0]).as_dict().cloned();
-        gs.vertical = font_dict.as_ref().is_some_and(|fd| is_vertical(doc, fd));
-        gs.font = font_dict.as_ref().map(|fd| Rc::new(Metrics::from_dict(doc, fd))).unwrap_or_else(|| fallback.clone());
+    if let Some((font, vertical, size)) = extgstate_font(doc, scope, ext_gstates, &name, fallback) {
+        (gs.font, gs.vertical, gs.size) = (font, vertical, size);
         gs.font_gs = Some(name.clone());
     }
     let smask_obj = d.get(b"SMask")?;
@@ -1658,7 +1749,7 @@ fn extgstate_op(
     let Object::Stream(s) = &*g_obj else { return None };
     let m = s.dict.get(b"Matrix").and_then(|m| Matrix::from_operands(doc.resolve(m).as_array()?)).unwrap_or_default();
     let fctm = m.then(&gs.ctm);
-    match sanitize_stream_form(doc, scope, (g_ref, s), fctm, None, resources, out) {
+    match sanitize_stream_form(doc, scope, (g_ref, s), Gs { ctm: fctm, ..gs.clone() }, None, resources, out) {
         StreamOutcome::Unchanged => None,
         StreamOutcome::Removed => {
             if let Some(sr) = smask_ref {
@@ -1778,7 +1869,7 @@ fn pattern_op(
     doc: &mut Document,
     scope: &mut Scope<'_>,
     op: &Op,
-    (gs_ctm, initial_ctm): (&Matrix, &Matrix),
+    (gs, initial_ctm): (&Gs, &Matrix),
     resources: &Dict,
     patterns: &mut Dict,
     out: &mut Output,
@@ -1789,8 +1880,8 @@ fn pattern_op(
     let Object::Stream(s) = &*obj else { return None };
     let m = s.dict.get(b"Matrix").and_then(|m| Matrix::from_operands(doc.resolve(m).as_array()?)).unwrap_or_default();
     let pctm = m.then(initial_ctm);
-    let rects = pattern_rects(doc, &s.dict, &pctm, gs_ctm, &m, scope.rects);
-    match sanitize_stream_form(doc, scope, (r, s), pctm, Some(&rects), resources, out) {
+    let rects = pattern_rects(doc, &s.dict, &pctm, &gs.ctm, &m, scope.rects);
+    match sanitize_stream_form(doc, scope, (r, s), Gs { ctm: pctm, ..gs.clone() }, Some(&rects), resources, out) {
         StreamOutcome::Unchanged => None,
         StreamOutcome::Removed => {
             out.replaced_patterns.push(name);
@@ -1821,7 +1912,7 @@ fn xobject(
     xobjects: &mut Dict,
     out: &mut Output,
 ) -> Option<Option<Op>> {
-    let name = op.name(0)?.to_vec();
+    let name = op.last_name()?.to_vec();
     let r = xobjects.get(&name)?.as_ref()?;
     let obj = doc.get(r);
     let Object::Stream(s) = &*obj else { return None };
@@ -1872,7 +1963,7 @@ fn xobject(
         Some(b"Form") => {
             let m = s.dict.get(b"Matrix").and_then(|m| Matrix::from_operands(doc.resolve(m).as_array()?)).unwrap_or_default();
             let fctm = m.then(&gs.ctm);
-            match sanitize_stream_form(doc, scope, (r, s), fctm, None, resources, out) {
+            match sanitize_stream_form(doc, scope, (r, s), Gs { ctm: fctm, ..gs.clone() }, None, resources, out) {
                 StreamOutcome::Unchanged => None,
                 StreamOutcome::Removed => {
                     out.replaced.push(name);

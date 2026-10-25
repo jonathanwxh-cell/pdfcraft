@@ -1,11 +1,12 @@
 //! PowerPoint presentation (.pptx, Office Open XML PresentationML): slides per page,
 //! largest text as slide title, remaining paragraphs as body text, images and tables between them.
 
-use crate::{Block, Image, Page, Table, Zip, esc, hex};
+use crate::{Image, Page, Run, Table, Zip, esc, hex};
 
 /// Items on a slide in reading order.
 enum SlideBodyItem<'a> {
-    Para(&'a Block),
+    /// A paragraph's runs (at least one).
+    Para(Vec<Run<'a>>),
     Table(Table),
     Img(&'a Image),
 }
@@ -132,15 +133,16 @@ pub fn pptx(pages: &[Page], title: &str) -> Vec<u8> {
             .iter()
             .enumerate()
             .filter(|(i, b)| !consumed.get(*i).copied().unwrap_or(false) && !b.text.trim().is_empty())
-            .max_by(|(ia, a), (ib, b)| a.size.total_cmp(&b.size).then(ib.cmp(ia)))
+            .max_by(|(_, a), (_, b)| a.size.total_cmp(&b.size))
             .map(|(i, _)| i);
 
         let mut parts: Vec<([f64; 4], f64, SlideBodyItem)> = Vec::new();
-        for (bi, b) in p.blocks.iter().enumerate() {
-            if Some(bi) == title_idx || consumed.get(bi).copied().unwrap_or(false) {
-                continue;
-            }
-            parts.push((b.rect, b.size, SlideBodyItem::Para(b)));
+        // The title is a shape of its own, so it joins no paragraph.
+        let skip: Vec<bool> = (0..p.blocks.len()).map(|bi| Some(bi) == title_idx || consumed.get(bi).copied().unwrap_or(false)).collect();
+        for runs in crate::paragraphs(&p.blocks, &skip) {
+            let Some(first) = runs.first().map(|r| r.block) else { continue };
+            let x1 = runs.iter().map(|r| r.block.rect[2]).fold(first.rect[2], f64::max);
+            parts.push(([first.rect[0], first.rect[1], x1, first.rect[3]], first.size, SlideBodyItem::Para(runs)));
         }
         for t in tables {
             parts.push((t.rect, 11.0, SlideBodyItem::Table(t)));
@@ -173,11 +175,16 @@ pub fn pptx(pages: &[Page], title: &str) -> Vec<u8> {
                 SlideBodyItem::Para(_) => {
                     let mut paras_xml = String::new();
                     let mut est_h_pt = 0.0;
-                    while let Some(SlideBodyItem::Para(b)) = items.get(i) {
-                        let run = run_drawingml(&b.text, b.size, b.bold, b.italic, b.color);
-                        paras_xml.push_str(&format!("<a:p>{run}</a:p>"));
-                        let lines = (b.text.len() as f64 / 60.0).ceil().max(1.0);
-                        est_h_pt += (b.size.max(10.0) * 1.3) * lines + 6.0;
+                    while let Some(SlideBodyItem::Para(runs)) = items.get(i) {
+                        paras_xml.push_str("<a:p>");
+                        for r in runs {
+                            paras_xml.push_str(&run_drawingml(&r.text, r.block.size, r.block.bold, r.block.italic, r.block.color));
+                        }
+                        paras_xml.push_str("</a:p>");
+                        let len = runs.iter().map(|r| r.text.len()).fold(0usize, usize::saturating_add);
+                        let size = runs.iter().map(|r| r.block.size).fold(10.0, f64::max);
+                        let lines = (len as f64 / 60.0).ceil().max(1.0);
+                        est_h_pt += (size * 1.3) * lines + 6.0;
                         i += 1;
                     }
                     let box_h = height_emu(est_h_pt);
@@ -354,6 +361,7 @@ xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" type=\"blank\"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Block;
     use crate::tests::part;
 
     fn sample_page() -> Page {
@@ -369,6 +377,7 @@ mod tests {
                     italic: false,
                     color: [0.1, 0.2, 0.3],
                     rotation: 0.0,
+                    space_around: [false; 2],
                 },
                 Block {
                     text: "Revenue grew 25% year over year across all regions.".into(),
@@ -378,6 +387,7 @@ mod tests {
                     italic: false,
                     color: [0.0; 3],
                     rotation: 0.0,
+                    space_around: [false; 2],
                 },
                 Block {
                     text: "Operational expenses remained flat.".into(),
@@ -387,6 +397,7 @@ mod tests {
                     italic: true,
                     color: [0.0; 3],
                     rotation: 0.0,
+                    space_around: [false; 2],
                 },
             ],
             images: vec![Image {
@@ -510,6 +521,7 @@ mod tests {
             italic: false,
             color: [0.0; 3],
             rotation: 0.0,
+            space_around: [false; 2],
         };
         let table_page = Page {
             width: 612.0,
@@ -611,6 +623,7 @@ mod tests {
             italic: false,
             color: [0.0; 3],
             rotation: 0.0,
+            space_around: [false; 2],
         };
         let mut blocks = vec![huge("Title", f64::MAX, 500.0)];
         for k in 0..40 {
@@ -682,6 +695,7 @@ mod tests {
             italic: false,
             color: [0.0; 3],
             rotation: 0.0,
+            space_around: [false; 2],
         };
         let p = Page {
             width: 720.0,
@@ -696,6 +710,7 @@ mod tests {
                     italic: false,
                     color: [0.0; 3],
                     rotation: 0.0,
+                    space_around: [false; 2],
                 },
                 // Table where one cell has a very large number (e.g. 36 pt callout in the table)
                 cell("Metric", 72.0, 400.0, 100.0, 12.0),

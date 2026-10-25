@@ -1475,31 +1475,40 @@ fn datasets_packet(doc: &Document) -> Result<Option<String>, XfaError> {
 /// cleared back to their template default (or empty) in the exported markup (#3945). A document
 /// whose packets can't be read is an error, not empty data.
 pub fn export_data(doc: &Document, xdp: bool, pdf_name: &str) -> Result<String, XfaError> {
-    if crate::read_packets(doc)?.is_none() {
-        return Err(XfaError::NotXfa);
-    }
-    let packet = match datasets_packet(doc)? {
-        Some(text) => {
-            let wants = password_dataset_wants(doc);
-            if wants.is_empty() {
-                Some(text)
-            } else {
-                Some(
-                    merge_all(&text, Within::Packet, &[Op::Values(&wants)], &mut Vec::new())
-                        .ok_or_else(|| XfaError::Malformed("the XFA data could not be read".into()))?,
-                )
-            }
-        }
-        None => None,
-    };
-    let (datasets, data) = match &packet {
-        Some(text) => match datasets_markup(text) {
-            Ok(Some(m)) => m,
-            Ok(None) => (fresh_datasets(""), String::new()),
-            Err(()) => return Err(XfaError::Malformed("the XFA data could not be read".into())),
-        },
+    let packets = crate::read_packets(doc)?.ok_or(XfaError::NotXfa)?;
+    // Normalize the same packet representation that will be exported before scanning it.
+    // Array packets may need the wrapper's namespace declarations or have several roots.
+    let (mut datasets, mut data) = match datasets_packet(doc)? {
+        Some(text) => datasets_markup(&text)
+            .map_err(|()| XfaError::Malformed("the XFA data could not be read".into()))?
+            .unwrap_or_else(|| (fresh_datasets(""), String::new())),
         None => (fresh_datasets(""), String::new()),
     };
+    if !data.is_empty() {
+        let parsed = parse_datasets(&datasets).ok_or_else(|| XfaError::Malformed("the XFA password data could not be read".into()))?;
+        // If a template exists, failing to read its password declarations is not an
+        // empty scan. Static forms without a template still use their AcroForm flags.
+        let template = if packets.xdp.trim().is_empty() {
+            None
+        } else {
+            Some(crate::parse(&packets.xdp).or_else(|_| crate::parse(&format!("{WRAP_OPEN}{}{WRAP_CLOSE}", packets.xdp)))?.0)
+        };
+        let wants = password_data_wants(doc, &parsed, template.as_ref());
+        if !wants.is_empty() {
+            let mut warnings = Vec::new();
+            let redacted = merge_all(&datasets, Within::Packet, &[Op::Values(&wants)], &mut warnings)
+                .ok_or_else(|| XfaError::Malformed("the XFA password values could not be cleared".into()))?;
+            // A successful leaf edit does not mean every requested value was replaced.
+            // Structured nodes and any other skipped writes must fail closed.
+            let checked = parse_datasets(&redacted).ok_or_else(|| XfaError::Malformed("the XFA password data could not be read".into()))?;
+            if !warnings.is_empty() || !password_data_wants(doc, &checked, template.as_ref()).is_empty() {
+                return Err(XfaError::Malformed("the XFA password values could not all be cleared".into()));
+            }
+            (datasets, data) = datasets_markup(&redacted)
+                .map_err(|()| XfaError::Malformed("the XFA data could not be read".into()))?
+                .ok_or_else(|| XfaError::Malformed("the XFA datasets are missing after clearing password values".into()))?;
+        }
+    }
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     if xdp {
         let (name, _) = escape(pdf_name);
@@ -1902,95 +1911,101 @@ fn password_dataset_wants(doc: &Document) -> Vec<Want> {
     }
     let Ok(Some(packet)) = datasets_packet(doc) else { return Vec::new() };
     let Some(data) = parse_datasets(&packet) else { return Vec::new() };
-    with_template(doc, None, |tpl| {
-        let mut candidates: Vec<(String, DataPath, String)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        if let Some(t) = tpl {
-            struct Walk<'a> {
-                tpl: &'a Template,
-                data: &'a DataNode,
-                nodes: usize,
-                seen: &'a mut std::collections::HashSet<DataPath>,
-                out: &'a mut Vec<(String, DataPath, String)>,
-            }
-            impl Walk<'_> {
-                fn child_som(parent: &str, name: Option<&str>, index: usize) -> String {
-                    match name {
-                        Some(n) if !parent.is_empty() => format!("{parent}.{n}[{index}]"),
-                        Some(n) => format!("{n}[{index}]"),
-                        None => parent.to_string(),
-                    }
+    with_template(doc, None, |tpl| password_data_wants(doc, &data, tpl))
+}
+
+/// Password values to clear in an already parsed data tree. Export passes the exact tree
+/// it will emit rather than treating an unreadable document packet as an empty scan.
+fn password_data_wants(doc: &Document, data: &DataNode, tpl: Option<&Template>) -> Vec<Want> {
+    let mut candidates: Vec<(String, DataPath, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(t) = tpl {
+        struct Walk<'a> {
+            tpl: &'a Template,
+            data: &'a DataNode,
+            nodes: usize,
+            seen: &'a mut std::collections::HashSet<DataPath>,
+            out: &'a mut Vec<(String, DataPath, String)>,
+        }
+        impl Walk<'_> {
+            fn child_som(parent: &str, name: Option<&str>, index: usize) -> String {
+                match name {
+                    Some(n) if !parent.is_empty() => format!("{parent}.{n}[{index}]"),
+                    Some(n) => format!("{n}[{index}]"),
+                    None => parent.to_string(),
                 }
-                fn walk(&mut self, children: &[Node], parent_som: &str, depth: usize) {
-                    if depth > MAX_DEPTH || self.nodes >= crate::script::MAX_FORM_NODES {
-                        return;
+            }
+            fn walk(&mut self, children: &[Node], parent_som: &str, depth: usize) {
+                if depth > MAX_DEPTH || self.nodes >= crate::script::MAX_FORM_NODES {
+                    return;
+                }
+                let sibs = SomIndices::of(children);
+                for (i, n) in children.iter().enumerate() {
+                    if self.nodes >= crate::script::MAX_FORM_NODES {
+                        break;
                     }
-                    let sibs = SomIndices::of(children);
-                    for (i, n) in children.iter().enumerate() {
-                        if self.nodes >= crate::script::MAX_FORM_NODES {
-                            break;
-                        }
-                        self.nodes += 1;
-                        let sib = sibs.at(i);
-                        match n {
-                            Node::Subform(sf) => {
-                                let from_data = match &sf.common.name {
-                                    Some(name) if sf.occur.max != Some(1) => self.data.count(&data_path(self.tpl, parent_som), name),
-                                    _ => 0,
-                                };
-                                let instances = crate::layout::instance_count(&sf.occur, from_data).max(from_data);
-                                for k in 0..instances {
-                                    if k > 0 {
-                                        if self.nodes >= crate::script::MAX_FORM_NODES {
-                                            break;
-                                        }
-                                        self.nodes += 1;
+                    self.nodes += 1;
+                    let sib = sibs.at(i);
+                    match n {
+                        Node::Subform(sf) => {
+                            let from_data = match &sf.common.name {
+                                Some(name) if sf.occur.max != Some(1) => self.data.count(&data_path(self.tpl, parent_som), name),
+                                _ => 0,
+                            };
+                            let instances = crate::layout::instance_count(&sf.occur, from_data).max(from_data);
+                            for k in 0..instances {
+                                if k > 0 {
+                                    if self.nodes >= crate::script::MAX_FORM_NODES {
+                                        break;
                                     }
-                                    let som = Self::child_som(parent_som, sf.common.name.as_deref(), sib + k);
-                                    self.walk(&sf.children, &som, depth + 1);
+                                    self.nodes += 1;
                                 }
+                                let som = Self::child_som(parent_som, sf.common.name.as_deref(), sib + k);
+                                self.walk(&sf.children, &som, depth + 1);
                             }
-                            Node::Area(a) => {
-                                let som = Self::child_som(parent_som, a.common.name.as_deref(), sib);
-                                self.walk(&a.children, &som, depth + 1);
-                            }
-                            Node::Field(f) if f.ui == Ui::PasswordEdit => {
-                                let som = Self::child_som(parent_som, f.common.name.as_deref().or(Some("field")), sib);
-                                let path = data_path(self.tpl, &som);
-                                if !path.is_empty() && self.seen.insert(path.clone()) {
-                                    let default = f.value.plain().map(|v| f.saved_value(v.trim())).unwrap_or_default();
-                                    self.out.push((som, path, default));
-                                }
-                            }
-                            _ => {}
                         }
+                        Node::Area(a) => {
+                            let som = Self::child_som(parent_som, a.common.name.as_deref(), sib);
+                            self.walk(&a.children, &som, depth + 1);
+                        }
+                        Node::Field(f) if f.ui == Ui::PasswordEdit => {
+                            let som = Self::child_som(parent_som, f.common.name.as_deref().or(Some("field")), sib);
+                            let path = data_path(self.tpl, &som);
+                            if !path.is_empty() && self.seen.insert(path.clone()) {
+                                let default = f.value.plain().map(|v| f.saved_value(v.trim())).unwrap_or_default();
+                                self.out.push((som, path, default));
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
-            let root = Node::Subform(Box::new(t.root.clone()));
-            let mut w = Walk { tpl: t, data: &data, nodes: 0, seen: &mut seen, out: &mut candidates };
-            w.walk(std::slice::from_ref(&root), "", 0);
-            if let Some(ps) = &t.root.page_set {
-                for (i, area) in ps.areas.iter().enumerate() {
-                    let som = area.name.clone().map(|n| format!("{n}[0]")).unwrap_or_else(|| format!("#pageArea[{i}]"));
-                    w.walk(&area.items, &som, 1);
-                }
+        }
+        let root = Node::Subform(Box::new(t.root.clone()));
+        let mut w = Walk { tpl: t, data, nodes: 0, seen: &mut seen, out: &mut candidates };
+        w.walk(std::slice::from_ref(&root), "", 0);
+        if let Some(ps) = &t.root.page_set {
+            for (i, area) in ps.areas.iter().enumerate() {
+                let som = area.name.clone().map(|n| format!("{n}[0]")).unwrap_or_else(|| format!("#pageArea[{i}]"));
+                w.walk(&area.items, &som, 1);
             }
         }
-        for (som, default) in acro_password_fields(doc) {
-            let path = path_of(tpl, &som);
-            if !path.is_empty() && seen.insert(path.clone()) {
-                candidates.push((som, path, default));
-            }
+    }
+    for (som, default) in acro_password_fields(doc) {
+        let path = path_of(tpl, &som);
+        if !path.is_empty() && seen.insert(path.clone()) {
+            candidates.push((som, path, default));
         }
-        candidates
-            .into_iter()
-            .filter_map(|(som, path, default)| {
-                let cur = data.value_at(&path)?;
-                (!cur.is_empty() && cur != default).then_some(Want { som, path, text: default, ensure: false })
-            })
-            .collect()
-    })
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(som, path, default)| {
+            let node = data.get(&path)?;
+            // A structured password node is not a scalar the writer can safely clear.
+            // Include it even when value_at would hide its contents as empty text.
+            (!node.children.is_empty() || (!node.text.is_empty() && node.text != default)).then_some(Want { som, path, text: default, ensure: false })
+        })
+        .collect()
 }
 
 /// Whether any XFA password field (`<passwordEdit/>` or an AcroForm text field with the Password

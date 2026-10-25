@@ -907,3 +907,114 @@ fn a_resized_added_picture_shows_only_at_its_new_size() {
     let pixels = h.render().unwrap();
     assert!(red(&pixels, kept) > 100 && red(&pixels, gone) == 0, "the page raster has the picture at its new size");
 }
+
+/// #4477, #3938: in Edit a PDF, an added image can be resized repeatedly by its corner handles
+/// (including the outer part of the handle circle and when a corner reaches past the page edge)
+/// without losing selection to the object marquee, and dragging an out-of-bounds image back onto
+/// the page does not smear edge pixels across the out-of-bounds half.
+#[test]
+fn added_picture_resizes_repeatedly_and_drags_back_from_out_of_bounds_without_smear() {
+    let _gpu = gpu();
+    let mut h = harness();
+    assert!(h.state_mut().execute("edit.edit_text"));
+    h.run_steps(2);
+    let mut png = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png, 60, 60);
+        enc.set_color(png::ColorType::Rgb);
+        let mut w = enc.write_header().unwrap();
+        w.write_image_data(&[200u8, 30, 30].repeat(3600)).unwrap();
+    }
+    h.state_mut().add_image("red.png".into(), png);
+    h.run_steps(3);
+    crate::support::settle(&mut h);
+
+    // 1. Grab the outer part of the lower-right corner handle (where the resize cursor is shown,
+    // outside r.expand(2.0)) and drag inward along one axis to shrink the image.
+    let rect0 = added(&h)[0].content.rect();
+    let r0 = item_on_screen(&h, rect0);
+    let grip1 = r0.expand(1.0).right_bottom() + egui::vec2(2.0, 2.0);
+    h.hover_at(grip1);
+    h.run_steps(2);
+    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::ResizeNwSe);
+    let to1 = grip1 + egui::vec2(-30.0, 0.0);
+    h.drag_at(grip1);
+    h.run_steps(1);
+    for k in 1..=4 {
+        h.hover_at(grip1 + (to1 - grip1) * (k as f32 / 4.0));
+        h.run_steps(1);
+    }
+    h.drop_at(to1);
+    h.run_steps(3);
+    assert_eq!(h.state().views[0].content.selected, Some((0, 0)), "the added image stays selected after releasing a corner resize");
+    let rect1 = added(&h)[0].content.rect();
+    assert!(rect1[2] - rect1[0] < (rect0[2] - rect0[0]) - 10.0, "first corner resize shrinks the image: {rect0:?} -> {rect1:?}");
+
+    // 2. Immediately resize again right after letting go, stretching past the right page edge,
+    // then shrink back from the out-of-bounds corner handle.
+    let r1 = item_on_screen(&h, rect1);
+    let page_right = h.state().views[0].page_screen_rect(0).unwrap().right();
+    let grip2 = r1.expand(1.0).right_bottom();
+    let to2 = pos2(page_right + 12.0, grip2.y);
+    h.hover_at(grip2);
+    h.run_steps(1);
+    h.drag_at(grip2);
+    h.run_steps(1);
+    for k in 1..=4 {
+        h.hover_at(grip2 + (to2 - grip2) * (k as f32 / 4.0));
+        h.run_steps(1);
+    }
+    h.drop_at(to2);
+    h.run_steps(3);
+    let rect2 = added(&h)[0].content.rect();
+    assert!(rect2[2] > 300.0, "second resize reaches past the page edge: {rect2:?}");
+
+    // Grab the corner handle that now sits outside the page rect and shrink it back inside.
+    let r2 = item_on_screen(&h, rect2);
+    let grip3 = r2.expand(1.0).right_bottom();
+    assert!(!h.state().views[0].page_screen_rect(0).unwrap().contains(grip3), "corner handle lies outside the page rect");
+    let to3 = pos2(page_right - 40.0, grip3.y);
+    h.hover_at(grip3);
+    h.run_steps(2);
+    assert_eq!(h.output().platform_output.cursor_icon, egui::CursorIcon::ResizeNwSe);
+    h.drag_at(grip3);
+    h.run_steps(1);
+    for k in 1..=4 {
+        h.hover_at(grip3 + (to3 - grip3) * (k as f32 / 4.0));
+        h.run_steps(1);
+    }
+    h.drop_at(to3);
+    h.run_steps(3);
+    let rect3 = added(&h)[0].content.rect();
+    assert!(rect3[2] < 300.0, "out-of-bounds corner handle still resizes the image back inside: {rect2:?} -> {rect3:?}");
+
+    // 3. Place the image half below the bottom edge of the page (y = -30..30), wait for the page
+    // raster, then drag it up into the page: the out-of-bounds bottom half must not smear the
+    // page edge's red texels across the lower half during the drag preview.
+    let img = match &added(&h)[0].content {
+        pdfcraft_engine::AddedContent::Image(i) => pdfcraft_engine::AddedImage { rect: [120.0, -30.0, 180.0, 30.0], ..i.clone() },
+        _ => panic!(),
+    };
+    assert!(h.state_mut().apply_edit(pdfcraft_engine::Edit::UpdateContent { page: 0, index: 0, content: pdfcraft_engine::AddedContent::Image(img) }));
+    crate::support::settle(&mut h);
+    let from = item_on_screen(&h, [120.0, -30.0, 180.0, 30.0]);
+    let grab = pos2(from.center().x, from.top() + 10.0);
+    let shift = egui::vec2(0.0, -120.0);
+    h.hover_at(grab);
+    h.run_steps(1);
+    h.drag_at(grab);
+    h.run_steps(1);
+    for k in 1..=4 {
+        h.hover_at(grab + shift * (k as f32 / 4.0));
+        h.run_steps(1);
+    }
+    crate::support::settle(&mut h);
+    let moved = from.translate(shift);
+    let upper_half = egui::Rect::from_min_max(moved.min + egui::vec2(4.0, 4.0), pos2(moved.max.x - 4.0, moved.center().y - 4.0));
+    let lower_half = egui::Rect::from_min_max(pos2(moved.min.x + 4.0, moved.center().y + 4.0), moved.max - egui::vec2(4.0, 4.0));
+    let pixels = h.render().unwrap();
+    assert!(red(&pixels, upper_half) > 100, "the in-bounds half of the picture follows the drag");
+    assert_eq!(red(&pixels, lower_half), 0, "the out-of-bounds half must not smear edge texels across the lower half");
+    h.drop_at(grab + shift);
+    crate::support::settle(&mut h);
+}

@@ -675,9 +675,7 @@ impl Layouter<'_> {
         let matches = |a: &PageArea| {
             a.name.as_deref() == Some(leaf) || a.id.as_deref() == Some(leaf) || a.name.as_deref() == Some(raw) || a.id.as_deref() == Some(raw)
         };
-        (0..self.areas.len())
-            .find(|&i| matches(&self.areas[i]) && self.areas[i].occur_max.is_none_or(|m| self.uses[i] < m))
-            .or_else(|| (0..self.areas.len()).find(|&i| matches(&self.areas[i])))
+        (0..self.areas.len()).find(|&i| matches(&self.areas[i]) && self.areas[i].occur_max.is_none_or(|m| self.uses[i] < m))
     }
 
     fn new_page(&mut self) -> Result<(), XfaError> {

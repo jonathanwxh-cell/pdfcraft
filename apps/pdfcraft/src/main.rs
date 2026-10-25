@@ -387,6 +387,37 @@ fn native_wayland(_: &eframe::CreationContext<'_>) -> bool {
     false
 }
 
+/// Decode `png` as a [`winit::window::Icon`] for the Windows taskbar and Alt+Tab (`ICON_BIG`).
+#[cfg(target_os = "windows")]
+fn taskbar_icon(png: &[u8]) -> Option<winit::window::Icon> {
+    let icon = match eframe::icon_data::from_png_bytes(png) {
+        Ok(icon) => icon,
+        Err(e) => {
+            log::warn!("taskbar icon: {e}");
+            return None;
+        }
+    };
+    match winit::window::Icon::from_rgba(icon.rgba, icon.width, icon.height) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            log::warn!("taskbar icon: {e}");
+            None
+        }
+    }
+}
+
+/// Windows shows a window's big icon (`ICON_BIG`) in the taskbar and Alt+Tab; `ViewportBuilder::with_icon`
+/// only sets the small icon (`ICON_SMALL`, used by the title bar), so the taskbar and Alt+Tab otherwise
+/// show a generic icon (#3818).
+#[cfg(target_os = "windows")]
+fn set_taskbar_icon(window: &winit::window::Window) {
+    use winit::platform::windows::WindowExtWindows as _;
+    if let Some(icon) = taskbar_icon(APP_ICON_PNG) {
+        window.set_taskbar_icon(Some(icon));
+    }
+}
+
+/// Build the [`eframe::AppCreator`] closure that initializes [`PdfCraftApp`] once the window and renderer are ready.
 fn app_creator<'a>(
     launch: Launch,
     started: Rc<Cell<bool>>,
@@ -414,6 +445,9 @@ fn app_creator<'a>(
         // it is set to On or Off.
         #[cfg(target_os = "windows")]
         {
+            if let Some(window) = cc.winit_window() {
+                set_taskbar_icon(window);
+            }
             app.motion.source = Some(motion::source());
         }
         app.update_source = Some(std::sync::Arc::new(updates::latest_release));
@@ -900,6 +934,18 @@ mod tests {
         use super::native_options;
         assert_eq!(native_options(false, false, eframe::Renderer::Glow).viewport.decorations, None);
         assert_eq!(native_options(false, true, eframe::Renderer::Glow).viewport.decorations, Some(false));
+    }
+
+    #[test]
+    fn the_window_and_windows_taskbar_icons_load_from_the_bundled_png() {
+        let icon = super::native_options(false, false, eframe::Renderer::Glow).viewport.icon.expect("the bundled PNG decodes as the window icon");
+        assert!(icon.width > 0 && icon.height > 0);
+        assert_eq!(icon.rgba.len(), (icon.width as usize) * (icon.height as usize) * 4);
+        #[cfg(target_os = "windows")]
+        {
+            assert!(super::taskbar_icon(super::APP_ICON_PNG).is_some(), "issue #3818: ICON_BIG loads from APP_ICON_PNG");
+            assert!(super::taskbar_icon(b"not a png").is_none());
+        }
     }
 
     #[test]

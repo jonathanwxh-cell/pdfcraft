@@ -11,9 +11,10 @@
 //!
 //! 1. **Nothing panics.** A panic in a tool is a crashed MCP server or CLI (AGENTS.md §4), so
 //!    every call must come back as `Ok` or as a `ToolError` the agent can read.
-//! 2. **Nothing escapes `--root`.** Every path argument is tried with `..` traversal, absolute
-//!    paths, Windows drive and UNC paths, and a planted symbolic link. The call must fail, and
-//!    afterwards nothing outside the root may have been created.
+//! 2. **Nothing escapes `--root` or the automation roots.** Every path argument is tried with `..`
+//!    traversal, absolute paths, Windows drive and UNC paths, and a planted symbolic link, under
+//!    both `--root` and `--automation-read-root`/`--automation-write-root` (#4003). The call must
+//!    fail, and afterwards nothing outside the root may have been created.
 //!
 //! The second is the mechanized form of the D3 audit. Reading the code says every handler resolves
 //! its own paths and that no tool dispatches another internally; this keeps that true as tools are
@@ -22,6 +23,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 
+use pdfcraft_automation::file_access::AutomationRoots;
 use pdfcraft_automation::{Automation, ToolError, tools};
 use serde_json::{Value, json};
 
@@ -84,6 +86,7 @@ fn zoo() -> Vec<Value> {
 /// bug can only touch what the test made. `linked`: the root holds `link-out`, a symbolic link
 /// to `base`.
 fn escapes(base: &std::path::Path, linked: bool) -> Vec<String> {
+    let root = base.join("root");
     let mut out: Vec<String> = vec![
         "../outside.pdf".into(),
         "../../outside.pdf".into(),
@@ -93,13 +96,16 @@ fn escapes(base: &std::path::Path, linked: bool) -> Vec<String> {
         base.join("outside.pdf").to_string_lossy().into_owned(),
         base.join("new-outside.pdf").to_string_lossy().into_owned(),
         base.join("sub").join("new-outside.pdf").to_string_lossy().into_owned(),
+        root.join("..").join("outside.pdf").to_string_lossy().into_owned(),
     ];
     if linked {
         out.push("link-out/outside.pdf".into());
+        out.push(root.join("link-out").join("outside.pdf").to_string_lossy().into_owned());
     }
     // Backslashes separate only on Windows; elsewhere this is an ordinary file name in the root.
     if cfg!(windows) {
         out.push(r"..\..\outside.pdf".into());
+        out.push(r"\\.\pipe\pdfcraft-hostile-escape.pdf".into());
     }
     out
 }
@@ -313,28 +319,31 @@ fn no_tool_escapes_the_root() {
         }
     };
 
-    let mut a = Automation::new().with_root(&root).expect("root");
-
-    // A real document, so tools reach their path arguments instead of failing on `doc` first.
-    let doc = blank_doc(&mut a);
+    let roots = AutomationRoots::new(Some(&root), Some(&root)).expect("roots");
+    let modes = [("--root", Automation::new().with_root(&root).expect("root")), ("automation roots", Automation::new().with_automation_roots(roots))];
 
     let mut leaked = Vec::new();
     let mut tried = 0usize;
     let mut refused = 0usize;
 
-    for def in tools() {
-        for (prop, is_list) in path_props(&def) {
-            for escape in escapes(&base, linked) {
-                let mut obj = plausible_with(&def, Some(doc));
-                obj.insert(prop.clone(), if is_list { json!([escape]) } else { json!(escape) });
-                let args = Value::Object(obj);
-                tried += 1;
-                match catch_unwind(AssertUnwindSafe(|| a.call(def.name, &args))) {
-                    // A path that leaves the root must be refused. Succeeding means the tool
-                    // either used it or ignored an argument it declares — both are faults.
-                    Ok(Ok(_)) => leaked.push(format!("{} accepted {prop}={escape:?}", def.name)),
-                    Ok(Err(_)) => refused += 1,
-                    Err(_) => leaked.push(format!("{} panicked on {prop}={escape:?}", def.name)),
+    for (mode, mut a) in modes {
+        // A real document, so tools reach their path arguments instead of failing on `doc` first.
+        let doc = blank_doc(&mut a);
+
+        for def in tools() {
+            for (prop, is_list) in path_props(&def) {
+                for escape in escapes(&base, linked) {
+                    let mut obj = plausible_with(&def, Some(doc));
+                    obj.insert(prop.clone(), if is_list { json!([escape]) } else { json!(escape) });
+                    let args = Value::Object(obj);
+                    tried += 1;
+                    match catch_unwind(AssertUnwindSafe(|| a.call(def.name, &args))) {
+                        // A path that leaves the root must be refused. Succeeding means the tool
+                        // either used it or ignored an argument it declares — both are faults.
+                        Ok(Ok(_)) => leaked.push(format!("{mode}: {} accepted {prop}={escape:?}", def.name)),
+                        Ok(Err(_)) => refused += 1,
+                        Err(_) => leaked.push(format!("{mode}: {} panicked on {prop}={escape:?}", def.name)),
+                    }
                 }
             }
         }

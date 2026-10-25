@@ -3857,3 +3857,116 @@ fn clear_password_values_clears_static_xfa_password_fields() {
     let packets = read_packets(&doc).unwrap().unwrap();
     assert!(!packets.xdp.contains("hunter2"), "{}", packets.xdp);
 }
+
+/// #3910: `<breakBefore target="…" targetType="pageArea"/>`, `<breakAfter target="…"/>` and
+/// `<break before="pageArea" beforeTarget="…"/>` switch to the named `pageArea` master (including
+/// landscape masters after unbounded portrait masters) and give sections on that master its full
+/// content-area width.
+#[test]
+fn named_page_area_breaks_switch_between_portrait_and_landscape_masters() {
+    let xml = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">
+ <subform name="form1" layout="tb">
+  <pageSet>
+   <pageArea name="Page1" id="PA1">
+    <contentArea x="25mm" y="44.45mm" w="172.5mm" h="232.55mm"/>
+    <medium stock="a4" short="210mm" long="297mm"/>
+   </pageArea>
+   <pageArea name="Page2" id="PA2">
+    <contentArea x="25mm" y="31.75mm" w="172.5mm" h="245.25mm"/>
+    <medium stock="a4" short="210mm" long="297mm"/>
+   </pageArea>
+   <pageArea name="Page3" id="PA3">
+    <contentArea x="25mm" y="28.575mm" w="259.5mm" h="161.875mm"/>
+    <medium stock="a4" short="210mm" long="297mm" orientation="landscape"/>
+   </pageArea>
+  </pageSet>
+  <subform name="intro" layout="tb">
+   <field name="f1" w="150mm" h="20mm"><ui><textEdit/></ui></field>
+  </subform>
+  <subform name="wide_flow" layout="tb">
+   <breakBefore target="Page3" targetType="pageArea" startNew="1"/>
+   <field name="f_wide1" w="240mm" h="100mm"><ui><textEdit/></ui></field>
+   <field name="f_wide2" w="240mm" h="100mm"><ui><textEdit/></ui></field>
+  </subform>
+  <subform name="back_portrait" layout="tb">
+   <breakBefore target="Page2" targetType="pageArea" startNew="1"/>
+   <field name="f_p2" w="160mm" h="20mm"><ui><textEdit/></ui></field>
+  </subform>
+  <subform name="wide_positioned" w="250mm" h="50mm">
+   <break before="pageArea" beforeTarget="#PA3" after="pageArea" afterTarget="Page1"/>
+   <field name="f_pos" x="200mm" y="5mm" w="45mm" h="15mm"><ui><textEdit/></ui></field>
+  </subform>
+  <subform name="outro" layout="tb">
+   <field name="f_end" w="120mm" h="20mm"><ui><textEdit/></ui></field>
+  </subform>
+ </subform>
+</template>"##;
+    let form = layout_xml(xml).unwrap();
+    // Pages:
+    // 0: Page1 (portrait) — intro
+    // 1: Page3 (landscape) — wide_flow part 1 (f_wide1)
+    // 2: Page3 (landscape) — wide_flow overflow (f_wide2 stays on Page3)
+    // 3: Page2 (portrait) — back_portrait
+    // 4: Page3 (landscape) — wide_positioned (via #PA3)
+    // 5: Page1 (portrait) — outro (afterTarget="Page1")
+    assert_eq!(form.pages.len(), 6, "expected 6 pages, got {}", form.pages.len());
+    let is_landscape = |p: &Page| p.width > p.height && (p.width - 841.89).abs() < 1.0 && (p.height - 595.28).abs() < 1.0;
+    let is_portrait = |p: &Page| p.height > p.width && (p.width - 595.28).abs() < 1.0 && (p.height - 841.89).abs() < 1.0;
+    assert!(is_portrait(&form.pages[0]), "page 1 is Page1 portrait: {:?}", (form.pages[0].width, form.pages[0].height));
+    assert!(is_landscape(&form.pages[1]), "page 2 is Page3 landscape: {:?}", (form.pages[1].width, form.pages[1].height));
+    assert!(is_landscape(&form.pages[2]), "page 3 overflow stays on Page3 landscape: {:?}", (form.pages[2].width, form.pages[2].height));
+    assert!(is_portrait(&form.pages[3]), "page 4 switches to Page2 portrait: {:?}", (form.pages[3].width, form.pages[3].height));
+    assert!(is_landscape(&form.pages[4]), "page 5 positioned subform switches to #PA3 landscape");
+    assert!(is_portrait(&form.pages[5]), "page 6 afterTarget switches back to Page1 portrait");
+
+    // Wide fields on Page3 keep their full 240mm (~680.3pt) width rather than being clamped to
+    // Page1's 172.5mm (~489pt) portrait content area.
+    let widget_w = |page: usize, name: &str| -> f64 {
+        form.pages[page]
+            .items
+            .iter()
+            .find_map(|it| match it {
+                Item::Widget(w) if w.name == name => Some(w.rect.w),
+                _ => None,
+            })
+            .unwrap_or(0.0)
+    };
+    assert!(widget_w(1, "f_wide1") > 670.0, "f_wide1 width on landscape page: {}", widget_w(1, "f_wide1"));
+    assert!(widget_w(2, "f_wide2") > 670.0, "f_wide2 width on landscape overflow page: {}", widget_w(2, "f_wide2"));
+    let pos_right = form.pages[4]
+        .items
+        .iter()
+        .find_map(|it| match it {
+            Item::Widget(w) if w.name == "f_pos" => Some(w.rect.x + w.rect.w),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    assert!(pos_right > 600.0, "f_pos at x=200mm on landscape page is not clipped: {pos_right}");
+
+    // When the very first subform targets Page3, page 1 itself uses Page3 without an extra blank page,
+    // `<overflow target="…"/>` directs overflow pages to a named master, and `<breakAfter target="…"/>`
+    // switches the following page master.
+    let first_landscape = r##"<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">
+ <subform name="form1" layout="tb">
+  <pageSet>
+   <pageArea name="Page1" id="PA1"><contentArea x="25mm" y="25mm" w="160mm" h="247mm"/><medium stock="a4" short="210mm" long="297mm"/></pageArea>
+   <pageArea name="Page3" id="PA3"><contentArea x="25mm" y="25mm" w="247mm" h="160mm"/><medium stock="a4" short="210mm" long="297mm" orientation="landscape"/></pageArea>
+  </pageSet>
+  <subform name="first" layout="tb">
+   <breakBefore target="#pageSet.Page3[0]" targetType="pageArea" startNew="1"/>
+   <overflow target="pageSet.#PA1"/>
+   <breakAfter target="Page3" targetType="pageArea"/>
+   <field name="f1" w="220mm" h="100mm"><ui><textEdit/></ui></field>
+   <field name="f2" w="150mm" h="100mm"><ui><textEdit/></ui></field>
+  </subform>
+  <subform name="after" layout="tb">
+   <field name="f3" w="220mm" h="20mm"><ui><textEdit/></ui></field>
+  </subform>
+ </subform>
+</template>"##;
+    let first_form = layout_xml(first_landscape).unwrap();
+    assert_eq!(first_form.pages.len(), 3);
+    assert!(is_landscape(&first_form.pages[0]), "first page switched to Page3 landscape");
+    assert!(is_portrait(&first_form.pages[1]), "overflow target switched page 2 to PA1 portrait");
+    assert!(is_landscape(&first_form.pages[2]), "breakAfter target switched page 3 back to Page3 landscape");
+}

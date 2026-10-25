@@ -78,6 +78,7 @@ impl PdfCraftApp {
                 if let Some(page) = comment_page(&edit).or_else(|| content_page(&edit)) {
                     // Comment and content edits change one page: keep every other raster.
                     view.page_changed(page);
+                    view.comments.document_changed(info);
                 } else if let Some(form_before) = form_before
                     && doc.info.pages.len() == page_count_before
                     && doc.xfa.is_some() == had_xfa
@@ -130,6 +131,7 @@ impl PdfCraftApp {
                     for page in changed_pages {
                         view.page_changed(page);
                     }
+                    view.comments.document_changed(info);
                 } else {
                     view.document_changed(info);
                 }

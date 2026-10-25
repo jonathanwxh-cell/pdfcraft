@@ -793,16 +793,23 @@ pub fn set_annots(doc: &mut Document, page: ObjRef, list: Vec<Object>) -> Result
     Ok(())
 }
 
-/// The annotation at `(page, index)` as an indirect object (inline dictionaries are promoted).
+/// Whether the annotation dictionary `d` has a comment `/Subtype` ([`is_comment_subtype`]).
+fn is_comment_dict(d: &Dict) -> bool {
+    d.name(b"Subtype").is_some_and(|s| is_comment_subtype(&String::from_utf8_lossy(s)))
+}
+
+/// The comment annotation at `(page, index)` as an indirect object (inline dictionaries are promoted).
 fn annot_ref(doc: &mut Document, page: usize, index: usize) -> Result<(ObjRef, ObjRef), AnnotError> {
     let p = page_ref(doc, page)?;
     let mut list = annots(doc, p);
     let entry = list.get(index).cloned().ok_or(AnnotError::NoSuchAnnotation { page, index })?;
     let r = match entry {
-        Object::Ref(r) if doc.get(r).as_dict().is_some() => r,
-        Object::Dict(d) => {
+        Object::Ref(r) if doc.get(r).as_dict().is_some_and(is_comment_dict) => r,
+        Object::Dict(d) if is_comment_dict(&d) => {
             let r = doc.add(Object::Dict(d));
-            list[index] = Object::Ref(r);
+            if let Some(slot) = list.get_mut(index) {
+                *slot = Object::Ref(r);
+            }
             set_annots(doc, p, list)?;
             r
         }
@@ -1665,6 +1672,10 @@ pub fn delete_annotation(doc: &mut Document, page: usize, index: usize) -> Resul
     let p = page_ref(doc, page)?;
     let list = annots(doc, p);
     let target = list.get(index).cloned().ok_or(AnnotError::NoSuchAnnotation { page, index })?;
+    let target_obj = target.as_ref().map_or_else(|| doc.resolve(&target), |r| doc.get(final_ref(doc, r)));
+    if !target_obj.as_dict().is_some_and(is_comment_dict) {
+        return Err(AnnotError::NoSuchAnnotation { page, index });
+    }
     if let Some(r) = target.as_ref() {
         unlocked(doc, r)?;
     }
@@ -2492,6 +2503,9 @@ pub fn props(doc: &Document, page: usize, index: usize) -> Option<Props> {
     let obj = doc.resolve(&entry);
     let d = obj.as_dict()?;
     let subtype = String::from_utf8_lossy(d.name(b"Subtype")?).into_owned();
+    if !is_comment_subtype(&subtype) {
+        return None;
+    }
     let c: Vec<f64> = d.get(b"C").and_then(|o| o.as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).collect())).unwrap_or_default();
     let color = if subtype == "FreeText" { Some(appearance::parse_da(d).0) } else { (c.len() == 3).then(|| [c[0], c[1], c[2]]) };
     let width = matches!(subtype.as_str(), "Square" | "Circle" | "Line" | "Ink" | "Polygon" | "PolyLine" | "FreeText").then(|| {

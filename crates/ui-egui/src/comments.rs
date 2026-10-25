@@ -532,6 +532,9 @@ pub struct CommentView {
     pub tool_done: bool,
     /// What the inline editor (`editing`) does with the keyboard the next time it is drawn.
     pub(crate) editor_focus: Option<EditorFocus>,
+    /// Snapshot of `(page, index, subtype, name)` slots from the last `DocInfo`, used to detect
+    /// when an edit removes or shifts `/Annots` entries under an active selection or editor.
+    slots: Vec<(usize, usize, String, Option<String>)>,
 }
 
 /// A one-off change to the keyboard focus of the Comments panel's inline editor. The editor
@@ -546,6 +549,54 @@ pub(crate) enum EditorFocus {
 }
 
 impl CommentView {
+    /// Initial commenting state for `info`, recording its current annotation slots.
+    pub(crate) fn from_info(info: &DocInfo) -> Self {
+        Self { slots: Self::snapshot_slots(info), ..Default::default() }
+    }
+
+    /// Captures `(page, index, subtype, name)` for every comment in `info`.
+    fn snapshot_slots(info: &DocInfo) -> Vec<(usize, usize, String, Option<String>)> {
+        info.annotations.iter().map(|a| (a.page, a.index, a.subtype.clone(), a.name.clone())).collect()
+    }
+
+    /// Prunes comment state whose `(page, index)` slot was removed or shifted by a document change.
+    pub(crate) fn document_changed(&mut self, info: &DocInfo) {
+        let next = Self::snapshot_slots(info);
+        let page_count = info.pages.len();
+        let same_slot = |page: usize, index: usize| -> bool {
+            let Some((_, _, sub, nm)) = next.iter().find(|(p, i, _, _)| *p == page && *i == index) else {
+                return false;
+            };
+            if self.slots.is_empty() {
+                return true;
+            }
+            let new_on_page = next.iter().filter(|(p, _, _, _)| *p == page).count();
+            let old_on_page = self.slots.iter().filter(|(p, _, _, _)| *p == page).count();
+            new_on_page >= old_on_page
+                && self.slots.iter().any(|(p, i, s, n)| *p == page && *i == index && s == sub && n == nm)
+                && self
+                    .slots
+                    .iter()
+                    .filter(|(p, i, _, _)| *p == page && *i <= index)
+                    .all(|(p, i, s, n)| next.iter().any(|(np, ni, ns, nn)| np == p && ni == i && ns == s && nn == n))
+        };
+        if self.selected.is_some_and(|(p, i)| !same_slot(p, i)) {
+            self.selected = None;
+        }
+        if self.editing.as_ref().is_some_and(|(p, i, _)| !same_slot(*p, *i)) {
+            self.editing = None;
+            self.editor_focus = None;
+        }
+        if self.composer.as_ref().is_some_and(|c| match c.kind {
+            ComposerKind::Edit(i) => !same_slot(c.page, i),
+            _ => c.page >= page_count,
+        }) {
+            self.composer = None;
+        }
+        self.gesture = None;
+        self.slots = next;
+    }
+
     /// Takes back the last point of a polygon, cloud or connected lines being drawn; the first
     /// point's removal cancels the drawing. Returns whether there was such a drawing.
     pub fn undo_point(&mut self) -> bool {
@@ -1677,7 +1728,9 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
     let c = view.comments.composer.take()?;
     let text = c.text.trim_end().to_string();
     match c.kind {
-        ComposerKind::Edit(index) => Some(Edit::SetAnnotationContents { page, index, text }),
+        ComposerKind::Edit(index) => {
+            info.annotations.iter().any(|a| a.page == page && a.index == index).then_some(Edit::SetAnnotationContents { page, index, text })
+        }
         ComposerKind::Note => {
             view.comments.tool_done = true;
             Some(new_comment(&cx, CommentTool::Note, Shape::Note { at: c.at, icon: NoteIcon::Comment }, text))
@@ -1844,7 +1897,7 @@ pub(crate) fn page_rotation(info: &DocInfo, page: usize) -> i64 {
 }
 
 /// Delete / Escape handling for comments (only while no text field has focus).
-pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView, tool: &mut QuickTool, allowed: bool) {
+pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, tool: &mut QuickTool, allowed: bool) {
     if !ctx.input(|i| i.pointer.any_down()) {
         view.comments.cancelled_drag = false;
     }
@@ -1864,7 +1917,9 @@ pub(crate) fn keys(ctx: &egui::Context, view: &mut DocView, tool: &mut QuickTool
         && ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
     {
         cv.selected = None;
-        view.pending_edit = Some(Edit::DeleteAnnotation { page, index });
+        if info.annotations.iter().any(|a| a.page == page && a.index == index && !a.locked) {
+            view.pending_edit = Some(Edit::DeleteAnnotation { page, index });
+        }
     }
 }
 
@@ -2668,5 +2723,82 @@ mod tests {
         let long = text_box_rect([0.0, 500.0], &"word ".repeat(80), 12.0, 0);
         assert_eq!(long[2], 300.0);
         assert!(long[3] - long[1] > 50.0);
+    }
+
+    #[test]
+    fn stale_comment_state_is_cleared_and_delete_never_hits_non_comment_slots() {
+        let annot = |index: usize, name: &str| Annotation {
+            page: 0,
+            index,
+            subtype: "Text".into(),
+            rect: [10.0, 10.0, 30.0, 30.0],
+            color: None,
+            author: None,
+            contents: Some(name.into()),
+            modified: None,
+            in_reply_to: None,
+            parent: None,
+            grouped: false,
+            name: Some(name.into()),
+            state: None,
+            quads: Vec::new(),
+            locked: false,
+            intent: None,
+            fill_sign: false,
+            no_rotate: false,
+            points: Vec::new(),
+        };
+        // Page 0 has a Widget at index 0 (not in `info.annotations`), and Text comments at 1 and 2.
+        let info = DocInfo {
+            pages: vec![PageInfo { width: 300.0, height: 400.0, label: String::new(), crop: [0.0, 0.0, 300.0, 400.0], rotation: 0 }],
+            annotations: vec![annot(1, "c1"), annot(2, "c2")],
+            ..Default::default()
+        };
+        let mut view = DocView::new(pdfcraft_engine::DocId(1), &info, crate::canvas::ViewDefaults::default());
+        view.comments.selected = Some((0, 2));
+        view.comments.open_editor(0, 2, "draft".into());
+        view.comments.composer = Some(Composer { page: 0, at: [10.0, 10.0], kind: ComposerKind::Edit(2), text: "body".into(), focus: false });
+        view.comments.gesture = Some(Gesture::Move { page: 0, index: 2, from: pos2(0.0, 0.0) });
+
+        // Moving/editing in place or appending a comment at index 3 preserves (0, 2) selection/editing.
+        let mut appended = info.clone();
+        appended.annotations.push(annot(3, "c3"));
+        view.document_changed(&appended);
+        assert_eq!(view.comments.selected, Some((0, 2)));
+        assert!(view.comments.editing.is_some());
+        assert!(view.comments.composer.is_some());
+        assert!(view.comments.gesture.is_none());
+
+        // Deleting comment 1 shifts comment 2 down to index 1: stale state at (0, 2) and shifted (0, 1) must clear.
+        let mut shifted = info.clone();
+        shifted.annotations = vec![annot(1, "c2")];
+        view.comments.selected = Some((0, 1));
+        view.comments.open_editor(0, 1, "for c1, not c2".into());
+        view.comments.composer = Some(Composer { page: 0, at: [10.0, 10.0], kind: ComposerKind::Edit(1), text: "for c1".into(), focus: false });
+        view.document_changed(&shifted);
+        assert_eq!(view.comments.selected, None);
+        assert_eq!(view.comments.editing, None);
+        assert_eq!(view.comments.composer, None);
+
+        // Pressing Delete when `selected` holds a widget index (0, 0) or stale index (0, 2) emits no edit.
+        let ctx = egui::Context::default();
+        for bad_index in [0, 2] {
+            view.comments.selected = Some((0, bad_index));
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let mut out = ctx.run_ui(input, |ui| {
+                let mut tool = QuickTool::Select;
+                keys(ui.ctx(), &mut view, &shifted, &mut tool, true);
+            });
+            out.textures_delta.clear();
+            assert_eq!(view.comments.selected, None);
+            assert_eq!(view.pending_edit, None, "index {bad_index} must not emit DeleteAnnotation");
+        }
     }
 }

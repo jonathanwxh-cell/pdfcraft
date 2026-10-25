@@ -258,9 +258,13 @@ fn xfa_export_data_rejects_password_child_budget_truncation() {
 
 #[test]
 fn xfa_export_data_rejects_password_instance_budget_truncation() {
+    // Layout caps each subform at 50 instances. Four levels exceed the 200,000-node
+    // scan budget using empty instances alone, with no later field/child to flag it.
     let text = r#"<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/"><template><subform name="form">
 <field name="pin"><ui><passwordEdit/></ui></field>
-<subform name="row"><occur initial="1000" max="-1"/><subform name="cell"><occur initial="1000" max="-1"/></subform></subform>
+<subform name="row"><occur initial="50" max="-1"/><subform name="cell"><occur initial="50" max="-1"/>
+<subform name="unit"><occur initial="50" max="-1"/><subform name="atom"><occur initial="50" max="-1"/></subform></subform>
+</subform></subform>
 </subform></template>
 <datasets><data><form><pin>boundary-secret</pin></form></data></datasets></xdp:xdp>"#;
     let doc = Document::open(Arc::new(xfa_shell(text))).unwrap();

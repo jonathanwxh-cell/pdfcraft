@@ -3970,3 +3970,148 @@ fn named_page_area_breaks_switch_between_portrait_and_landscape_masters() {
     assert!(is_portrait(&first_form.pages[1]), "overflow target switched page 2 to PA1 portrait");
     assert!(is_landscape(&first_form.pages[2]), "breakAfter target switched page 3 back to Page3 landscape");
 }
+
+/// A discarded page master must not consume field counts or names, even for a widget too
+/// small to be emitted. Earlier retained pages still own their counts and reservations.
+#[test]
+fn replacing_empty_page_restores_master_field_state() {
+    for prior_page in [false, true] {
+        let prior = if prior_page {
+            r#"<subform layout="tb"><breakAfter target="Discard"/><field name="body" w="20pt" h="20pt"><ui><textEdit/></ui></field></subform>"#
+        } else {
+            ""
+        };
+        let xml = format!(
+            r#"<template><subform layout="tb"><pageSet>
+ <pageArea name="Discard"><contentArea x="10pt" y="40pt" w="200pt" h="200pt"/>
+  <field name="shared" w="20pt" h="20pt"><ui><textEdit/></ui></field>
+  <field name="shared" x="25pt" w="20pt" h="20pt"><ui><textEdit/></ui></field>
+  <field name="tiny" w="20pt" h="0.5pt"><ui><textEdit/></ui></field>
+ </pageArea>
+ <pageArea name="Intermediate"><contentArea x="20pt" y="40pt" w="200pt" h="200pt"/>
+  <field name="shared" w="20pt" h="20pt"><ui><textEdit/></ui></field>
+  <field name="tiny" w="20pt" h="0.5pt"><ui><textEdit/></ui></field>
+ </pageArea>
+ <pageArea name="Kept"><contentArea x="30pt" y="40pt" w="200pt" h="200pt"/>
+  <field name="shared" w="20pt" h="20pt"><ui><textEdit/></ui></field>
+  <field name="tiny" x="25pt" w="20pt" h="20pt"><ui><textEdit/></ui></field>
+ </pageArea>
+ </pageSet>{prior}
+ <subform layout="tb"><breakBefore target="Intermediate"/></subform>
+ <subform layout="tb"><breakBefore target="Kept"/><field name="last" w="20pt" h="20pt"><ui><textEdit/></ui></field></subform>
+ </subform></template>"#
+        );
+        let form = layout_xml(&xml).unwrap();
+        assert_eq!(form.pages.len(), if prior_page { 2 } else { 1 });
+        let actual_fields: usize = form.pages.iter().map(|p| widgets(p).len()).sum();
+        assert_eq!(form.fields, actual_fields, "discarded master fields must not remain counted");
+        let kept = widgets(form.pages.last().unwrap());
+        let names: Vec<&str> = kept.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, if prior_page { vec!["shared_3", "tiny_2", "last"] } else { vec!["shared", "tiny", "last"] });
+        assert!(form.warnings.is_empty(), "{:?}", form.warnings);
+    }
+}
+
+/// Updating frame geometry at a break must include ancestors whose final child crosses several
+/// differently-sized masters before returning, while fixed widths keep their original geometry.
+#[test]
+fn flowed_frame_tracks_every_named_master_including_final_child() {
+    for (limits, widths, x_positions) in [
+        ("", [100.0, 240.0, 140.0], [10.0, 30.0, 50.0]),
+        (r#"minW="120pt" maxW="200pt""#, [100.0, 200.0, 140.0], [10.0, 30.0, 50.0]),
+        (r#"w="80pt""#, [80.0; 3], [10.0; 3]),
+    ] {
+        let xml = format!(
+            r#"<template><subform layout="tb" {limits}>
+ <border><edge/><fill><color value="230,230,230"/></fill></border>
+ <pageSet>
+  <pageArea name="A"><contentArea x="10pt" y="10pt" w="100pt" h="200pt"/></pageArea>
+  <pageArea name="B"><contentArea x="30pt" y="10pt" w="240pt" h="200pt"/></pageArea>
+  <pageArea name="C"><contentArea x="50pt" y="10pt" w="140pt" h="200pt"/></pageArea>
+ </pageSet>
+ <field name="first" w="20pt" h="20pt"><ui><textEdit/></ui></field>
+ <subform layout="tb">
+  <subform layout="tb"><breakBefore target="B"/><field name="second" w="20pt" h="20pt"><ui><textEdit/></ui></field></subform>
+  <subform layout="tb"><breakBefore target="C"/><field name="last" w="20pt" h="20pt"><ui><textEdit/></ui></field></subform>
+ </subform>
+ </subform></template>"#
+        );
+        let form = layout_xml(&xml).unwrap();
+        assert_eq!(form.pages.len(), 3);
+        for (i, page) in form.pages.iter().enumerate() {
+            let fills: Vec<Rect> = page.items.iter().filter_map(|it| if let Item::Fill { rect, .. } = it { Some(*rect) } else { None }).collect();
+            assert_eq!(fills, vec![Rect::new(x_positions[i], 10.0, widths[i], 20.0)], "page {i}, limits {limits}");
+            assert!(matches!(page.items.first(), Some(Item::Fill { .. })), "the fill stays below the widgets");
+        }
+        assert!(form.warnings.is_empty(), "{:?}", form.warnings);
+    }
+}
+
+/// A final field can move to another content area on the same page without another child
+/// observing the changed cursor, and replacing the initial master must refresh open frames too.
+#[test]
+fn flowed_frame_tracks_content_areas_and_initial_master_replacement() {
+    for replace_initial in [false, true] {
+        let unused = if replace_initial { r#"<pageArea name="Unused"><contentArea x="5pt" y="5pt" w="50pt" h="100pt"/></pageArea>"# } else { "" };
+        let xml = format!(
+            r#"<template><subform layout="tb"><border><edge/><fill/></border><pageSet>{unused}
+ <pageArea name="Used">
+  <contentArea x="10pt" y="10pt" w="100pt" h="100pt"/>
+  <contentArea x="130pt" y="10pt" w="240pt" h="100pt"/>
+  <contentArea x="390pt" y="10pt" w="140pt" h="100pt"/>
+ </pageArea></pageSet>
+ <subform layout="tb"><breakBefore target="Used"/>
+  <field name="a" w="20pt" h="80pt"><ui><textEdit/></ui></field>
+  <field name="b" w="20pt" h="80pt"><ui><textEdit/></ui></field>
+  <field name="c" w="20pt" h="80pt"><ui><textEdit/></ui></field>
+ </subform></subform></template>"#
+        );
+        let form = layout_xml(&xml).unwrap();
+        assert_eq!(form.pages.len(), 1);
+        let fills: Vec<Rect> =
+            form.pages[0].items.iter().filter_map(|it| if let Item::Fill { rect, .. } = it { Some(*rect) } else { None }).collect();
+        assert_eq!(fills, vec![Rect::new(10.0, 10.0, 100.0, 80.0), Rect::new(130.0, 10.0, 240.0, 80.0), Rect::new(390.0, 10.0, 140.0, 80.0)]);
+        assert!(form.warnings.is_empty(), "{:?}", form.warnings);
+    }
+}
+
+/// Restarting an auto-width child must keep the available width and inset supplied by an
+/// explicitly sized parent, even when the final child moves to a new content area.
+#[test]
+fn flowed_frame_keeps_fixed_parent_width_and_margins() {
+    let xml = r#"<template><subform layout="tb" w="80pt"><margin leftInset="5pt" rightInset="7pt"/>
+ <pageSet><pageArea>
+  <contentArea x="10pt" y="10pt" w="100pt" h="100pt"/>
+  <contentArea x="10pt" y="130pt" w="100pt" h="100pt"/>
+ </pageArea></pageSet>
+ <subform layout="tb"><border><edge/><fill/></border>
+  <field name="a" w="20pt" h="80pt"><ui><textEdit/></ui></field>
+  <field name="b" w="20pt" h="80pt"><ui><textEdit/></ui></field>
+ </subform></subform></template>"#;
+    let form = layout_xml(xml).unwrap();
+    assert_eq!(form.pages.len(), 1);
+    let fills: Vec<Rect> = form.pages[0].items.iter().filter_map(|it| if let Item::Fill { rect, .. } = it { Some(*rect) } else { None }).collect();
+    assert_eq!(fills, vec![Rect::new(15.0, 10.0, 68.0, 80.0), Rect::new(15.0, 130.0, 68.0, 80.0)]);
+    assert!(form.warnings.is_empty(), "{:?}", form.warnings);
+}
+
+/// A positioned block uses raw area moves while it splits. The next flowed sibling still
+/// receives the new area's horizontal geometry, even though its enclosing border is lost.
+#[test]
+fn flowed_sibling_after_split_block_uses_current_area_width() {
+    let xml = r#"<template><subform layout="tb"><pageSet><pageArea>
+ <contentArea x="10pt" y="10pt" w="100pt" h="100pt"/>
+ <contentArea x="130pt" y="10pt" w="240pt" h="100pt"/>
+ </pageArea></pageSet>
+ <subform w="80pt" h="160pt">
+  <field name="a" w="20pt" h="20pt"><ui><textEdit/></ui></field>
+  <field name="b" y="120pt" w="20pt" h="20pt"><ui><textEdit/></ui></field>
+ </subform>
+ <field name="after" w="200pt" h="20pt"><ui><textEdit/></ui></field>
+ </subform></template>"#;
+    let form = layout_xml(xml).unwrap();
+    assert_eq!(form.pages.len(), 1);
+    let after = widgets(&form.pages[0]).into_iter().find(|w| w.name == "after").unwrap();
+    assert_eq!((after.rect.x, after.rect.w), (130.0, 200.0));
+    assert!(form.warnings.is_empty(), "{:?}", form.warnings);
+}

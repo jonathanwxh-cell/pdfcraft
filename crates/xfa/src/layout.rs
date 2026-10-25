@@ -240,12 +240,27 @@ struct Frame {
     w: f64,
     margin: Margin,
     border: Option<Border>,
+    /// Width-less sections adapt to a new content area, using their original constraints.
+    width_limits: Option<(Option<f64>, Option<f64>)>,
     part: FlowMark,
     parts: Vec<(usize, usize, Rect)>,
     /// Something inside didn't fit its content area: an item cut across areas, or one placed past
     /// the area's bottom (a table row taller than an area, an overflow leader and the row after it
     /// that don't fit together). The border is left out ([`Layouter::finish_frame`]).
     lost: bool,
+}
+
+impl Frame {
+    fn fit_width(&mut self, (x, w): (f64, f64)) {
+        if let Some((min, max)) = self.width_limits {
+            self.x = x;
+            self.w = clamp_opt(w, min, max).min(w.max(1.0));
+        }
+    }
+
+    fn inner_width(&self) -> (f64, f64) {
+        (self.x + self.margin.left, (self.w - self.margin.horizontal()).max(1.0))
+    }
 }
 
 struct Cursor {
@@ -266,6 +281,10 @@ struct Layouter<'t> {
     pages: Vec<Page>,
     cur: Option<Cursor>,
     names: HashMap<String, usize>,
+    /// State before the current master was drawn, for replacing an otherwise empty page.
+    page_fields: usize,
+    /// Only names touched on this page, including reservations that emitted no widget.
+    page_names: HashMap<String, Option<usize>>,
     /// Field values by `id`, for embedded fields in rich text.
     values: HashMap<String, String>,
     warnings: Vec<String>,
@@ -324,6 +343,8 @@ pub fn layout(tpl: &Template, data: Option<&DataNode>) -> Result<Form, XfaError>
         pages: Vec::new(),
         cur: None,
         names: HashMap::new(),
+        page_fields: 0,
+        page_names: HashMap::new(),
         values,
         warnings: Vec::new(),
         warned: HashSet::new(),
@@ -679,6 +700,14 @@ impl Layouter<'_> {
         if let Some(old) = self.pages.pop() {
             self.items = self.items.saturating_sub(old.items.len());
         }
+        self.fields = self.page_fields;
+        for (name, previous) in self.page_names.drain() {
+            if let Some(count) = previous {
+                self.names.insert(name, count);
+            } else {
+                self.names.remove(&name);
+            }
+        }
         self.new_page_of(idx)?;
         let (rect, y, _) = self.cursor();
         let mut room = (rect.bottom() - y).max(0.0);
@@ -707,6 +736,7 @@ impl Layouter<'_> {
 
     /// Start a page from page area `idx`.
     fn new_page_of(&mut self, idx: usize) -> Result<(), XfaError> {
+        let old_area = self.cursor().0;
         if self.pages.len() >= MAX_PAGES {
             return Err(XfaError::TooLarge(format!("the form lays out to more than {MAX_PAGES} pages")));
         }
@@ -720,6 +750,9 @@ impl Layouter<'_> {
         self.pages.push(Page { width: area.width, height: area.height, items: Vec::new() });
         let content = area.content.first().copied().unwrap_or(Rect::new(0.0, 0.0, area.width, area.height));
         self.cur = Some(Cursor { area: idx, content: 0, rect: content, y: content.y, placed: false });
+        self.refresh_frame_widths(old_area);
+        self.page_fields = self.fields;
+        self.page_names.clear();
         // Master page content: positioned draws and fields.
         let ctx = Ctx { font: Font::default(), para: Para::default(), som: area.name.clone().map(|n| format!("{n}[0]")).unwrap_or_default() };
         let page_rect = Rect::new(0.0, 0.0, area.width, area.height);
@@ -737,10 +770,26 @@ impl Layouter<'_> {
             && let Some(next) = area.content.get(c.content + 1).copied()
         {
             let i = c.content + 1;
+            let old_area = c.rect;
             self.cur = Some(Cursor { area: c.area, content: i, rect: next, y: next.y, placed: false });
+            self.refresh_frame_widths(old_area);
             return Ok(());
         }
         self.new_page()
+    }
+
+    /// Refresh outer frames before their children, preserving each parent's available width
+    /// and margins. Raw area moves (a split block) keep their existing lost-border bookkeeping.
+    fn refresh_frame_widths(&mut self, old_area: Rect) {
+        let area = self.cursor().0;
+        if area == old_area {
+            return;
+        }
+        let mut available = (area.x, area.w);
+        for frame in &mut self.frames {
+            frame.fit_width(available);
+            available = frame.inner_width();
+        }
     }
 
     /// The current content area, how far down it the flow is, and whether anything has been
@@ -1092,7 +1141,7 @@ impl Layouter<'_> {
             // bounds this subform.
             let (x, w) = match avail {
                 Some(av) if rect == prev_rect => av,
-                _ => (rect.x, rect.w),
+                _ => self.frames.last().map_or((rect.x, rect.w), Frame::inner_width),
             };
             let w = clamp_opt(sf.common.w.unwrap_or(w), sf.common.min_w, sf.common.max_w).min(w.max(1.0));
             if !matches!(sf.layout, Layout::Tb | Layout::Table) || sf.common.h.is_some() {
@@ -1105,7 +1154,16 @@ impl Layouter<'_> {
             // Its border and fill go round what it takes from here, a part on each content area.
             let framed = match self.flow_mark() {
                 Some(part) => {
-                    self.frames.push(Frame { x, w, margin: m, border: sf.common.border.clone(), part, parts: Vec::new(), lost: false });
+                    self.frames.push(Frame {
+                        x,
+                        w,
+                        margin: m,
+                        border: sf.common.border.clone(),
+                        width_limits: sf.common.w.is_none().then_some((sf.common.min_w, sf.common.max_w)),
+                        part,
+                        parts: Vec::new(),
+                        lost: false,
+                    });
                     true
                 }
                 None => false,
@@ -1125,9 +1183,9 @@ impl Layouter<'_> {
                         let (r, _, _) = self.cursor();
                         if r != cur_rect && sf.common.w.is_none() {
                             cur_rect = r;
-                            let nw = clamp_opt(r.w, sf.common.min_w, sf.common.max_w).min(r.w.max(1.0));
-                            inner_x = r.x + m.left;
-                            inner_w = (nw - m.horizontal()).max(1.0);
+                            if framed && let Some(f) = self.frames.last() {
+                                (inner_x, inner_w) = f.inner_width();
+                            }
                         }
                         let csib = sibs.at(ci);
                         if flows_as_subform(child) {
@@ -1917,6 +1975,7 @@ impl Layouter<'_> {
     /// later ones get `_2`, `_3`, ….
     fn unique_name(&mut self, base: &str) -> String {
         let base = clean_name(base);
+        self.page_names.entry(base.clone()).or_insert_with(|| self.names.get(&base).copied());
         let n = self.names.entry(base.clone()).or_insert(0);
         *n += 1;
         if *n == 1 { base } else { format!("{base}_{n}") }

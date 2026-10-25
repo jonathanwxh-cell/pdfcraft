@@ -132,23 +132,23 @@ pub fn pptx(pages: &[Page], title: &str) -> Vec<u8> {
             .iter()
             .enumerate()
             .filter(|(i, b)| !consumed.get(*i).copied().unwrap_or(false) && !b.text.trim().is_empty())
-            .max_by(|(_, a), (_, b)| a.size.total_cmp(&b.size))
+            .max_by(|(ia, a), (ib, b)| a.size.total_cmp(&b.size).then(ib.cmp(ia)))
             .map(|(i, _)| i);
 
-        let mut items: Vec<(f64, f64, SlideBodyItem)> = Vec::new();
+        let mut parts: Vec<([f64; 4], f64, SlideBodyItem)> = Vec::new();
         for (bi, b) in p.blocks.iter().enumerate() {
             if Some(bi) == title_idx || consumed.get(bi).copied().unwrap_or(false) {
                 continue;
             }
-            items.push((b.rect[3], b.rect[0], SlideBodyItem::Para(b)));
+            parts.push((b.rect, b.size, SlideBodyItem::Para(b)));
         }
         for t in tables {
-            items.push((t.rect[3], t.rect[0], SlideBodyItem::Table(t)));
+            parts.push((t.rect, 11.0, SlideBodyItem::Table(t)));
         }
         for im in &p.images {
-            items.push((im.rect[3], im.rect[0], SlideBodyItem::Img(im)));
+            parts.push((im.rect, (im.rect[3] - im.rect[1]).max(11.0), SlideBodyItem::Img(im)));
         }
-        items.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
+        let items = crate::reading_order(p, parts);
 
         let mut current_y = my;
         let mut shapes = String::new();
@@ -168,12 +168,12 @@ pub fn pptx(pages: &[Page], title: &str) -> Vec<u8> {
         }
 
         let mut i = 0;
-        while let Some((_, _, item)) = items.get(i) {
+        while let Some(item) = items.get(i) {
             match item {
                 SlideBodyItem::Para(_) => {
                     let mut paras_xml = String::new();
                     let mut est_h_pt = 0.0;
-                    while let Some((_, _, SlideBodyItem::Para(b))) = items.get(i) {
+                    while let Some(SlideBodyItem::Para(b)) = items.get(i) {
                         let run = run_drawingml(&b.text, b.size, b.bold, b.italic, b.color);
                         paras_xml.push_str(&format!("<a:p>{run}</a:p>"));
                         let lines = (b.text.len() as f64 / 60.0).ceil().max(1.0);

@@ -365,6 +365,114 @@ pub(crate) fn tables(blocks: &[Block]) -> (Vec<Table>, Vec<bool>) {
     (out, consumed)
 }
 
+/// The dominant text rotation on `page` (in degrees, counterclockwise), weighted by character
+/// count, or `0.0` when the page's text is upright.
+fn page_rotation(page: &Page) -> f64 {
+    let mut by: Vec<(i64, f64, usize)> = Vec::new();
+    for b in &page.blocks {
+        if !b.rotation.is_finite() {
+            continue;
+        }
+        let k = b.rotation.round() as i64;
+        if let Some(e) = by.iter_mut().find(|e| e.0 == k) {
+            e.2 = e.2.saturating_add(b.text.len());
+        } else {
+            by.push((k, b.rotation, b.text.len()));
+        }
+    }
+    by.into_iter().max_by_key(|e| e.2).filter(|e| e.1.abs() > 0.1).map_or(0.0, |e| e.1)
+}
+
+/// Transform `rect` (`[x0, y0, x1, y1]`, `y` up) into the reading frame of text turned by
+/// `rotation` degrees counterclockwise (`[along0, across0, along1, across1]`). For upright text
+/// (`0°`), this is `rect` itself; for text turned 90° clockwise (`-90°`), `across` decreases from
+/// right to left so lines read in their natural order (#3657).
+fn in_reading_frame(rect: [f64; 4], rotation: f64) -> [f64; 4] {
+    if rotation.abs() <= 0.1 || !rotation.is_finite() {
+        return rect;
+    }
+    let (sin, cos) = rotation.to_radians().sin_cos();
+    let corners = [(rect[0], rect[1]), (rect[2], rect[1]), (rect[0], rect[3]), (rect[2], rect[3])];
+    let mut out = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+    for (x, y) in corners {
+        let along = x * cos + y * sin;
+        let across = y * cos - x * sin;
+        out = [out[0].min(along), out[1].min(across), out[2].max(along), out[3].max(across)];
+    }
+    out
+}
+
+/// Put a page's items (`(rect, line_height, item)`) into reading order (#3657):
+/// - coordinates are projected into the page's reading frame so turned text reads from first line
+///   to last line rather than left-to-right across vertical lines;
+/// - a column continues across a paragraph gap (up to 3.5 line heights below the previous item)
+///   before jumping to the top of the next column on its right, unless an unread item sits above
+///   the continuation in its own horizontal span, sits to its left, or continues the previous
+///   item on the same line.
+pub(crate) fn reading_order<T>(page: &Page, parts: Vec<([f64; 4], f64, T)>) -> Vec<T> {
+    let rot = page_rotation(page);
+    let mut parts: Vec<([f64; 4], f64, T)> = parts.into_iter().map(|(r, h, item)| (in_reading_frame(r, rot), h.clamp(1.0, 200.0), item)).collect();
+    if parts.len() <= 1 {
+        return parts.into_iter().map(|x| x.2).collect();
+    }
+    const MAX_COLUMN_ORDER: usize = 2000;
+    if parts.len() > MAX_COLUMN_ORDER {
+        parts.sort_by(|a, b| b.0[3].total_cmp(&a.0[3]).then(a.0[0].total_cmp(&b.0[0])));
+        return parts.into_iter().map(|x| x.2).collect();
+    }
+    let beside_left = |cb: &[f64; 4], lb: &[f64; 4]| {
+        let v = lb[3].min(cb[3]) - lb[1].max(cb[1]);
+        lb[2] <= cb[0] + COL_TOL && v > 0.5 * (lb[3] - lb[1]).min(cb[3] - cb[1])
+    };
+    let inline_after = |pb: &[f64; 4], ph: f64, rb: &[f64; 4]| {
+        let v = rb[3].min(pb[3]) - rb[1].max(pb[1]);
+        rb[0] >= pb[2] - 1.0 && rb[0] <= pb[2] + INLINE_GAP * ph && v > 0.5 * (rb[3] - rb[1]).min(pb[3] - pb[1])
+    };
+    let mut remaining: Vec<usize> = (0..parts.len()).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(parts.len());
+    while let Some(&top) = remaining.iter().max_by(|&&a, &&b| parts[a].0[3].total_cmp(&parts[b].0[3]).then(parts[b].0[0].total_cmp(&parts[a].0[0]))) {
+        let next_in_column = order.last().and_then(|&prev| {
+            let (pb, ph) = (parts[prev].0, parts[prev].1);
+            if remaining.iter().any(|&r| inline_after(&pb, ph, &parts[r].0)) {
+                return None;
+            }
+            let tol = ph * 0.5;
+            let c = remaining
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    let cb = parts[c].0;
+                    let overlap = cb[2].min(pb[2]) - cb[0].max(pb[0]);
+                    let minw = (cb[2] - cb[0]).min(pb[2] - pb[0]).max(1.0);
+                    cb[3] <= pb[1] + tol && pb[1] - cb[3] <= ph * 3.5 && overlap > minw * 0.3
+                })
+                .max_by(|&a, &b| parts[a].0[3].total_cmp(&parts[b].0[3]).then(parts[b].0[0].total_cmp(&parts[a].0[0])))?;
+            let cb = parts[c].0;
+            let blocked = remaining.iter().any(|&r| {
+                if r == c {
+                    return false;
+                }
+                let rb = parts[r].0;
+                (rb[3] > cb[3] + tol && rb[2].min(cb[2]) > rb[0].max(cb[0])) || beside_left(&cb, &rb)
+            });
+            (!blocked).then_some(c)
+        });
+        let pick = next_in_column.unwrap_or_else(|| {
+            let tb = parts[top].0;
+            remaining
+                .iter()
+                .copied()
+                .filter(|&c| beside_left(&tb, &parts[c].0))
+                .min_by(|&a, &b| parts[a].0[0].total_cmp(&parts[b].0[0]).then(parts[b].0[3].total_cmp(&parts[a].0[3])))
+                .unwrap_or(top)
+        });
+        remaining.retain(|&r| r != pick);
+        order.push(pick);
+    }
+    let mut slots: Vec<Option<T>> = parts.into_iter().map(|(_, _, item)| Some(item)).collect();
+    order.into_iter().filter_map(|i| slots.get_mut(i).and_then(Option::take)).collect()
+}
+
 fn items(pages: &[Page]) -> Vec<Item<'_>> {
     let body = body_size(pages);
     let mut out = Vec::new();
@@ -373,18 +481,16 @@ fn items(pages: &[Page]) -> Vec<Item<'_>> {
             out.push(Item::PageBreak);
         }
         let (tables, consumed) = tables(&p.blocks);
-        // Blocks and images by their top edge, top to bottom.
-        let mut parts: Vec<(f64, f64, Item)> = p
+        let mut parts: Vec<([f64; 4], f64, Item)> = p
             .blocks
             .iter()
             .enumerate()
             .filter(|(bi, _)| !consumed.get(*bi).copied().unwrap_or(false))
-            .map(|(_, b)| (b.rect[3], b.rect[0], Item::Para(b, level(b, body))))
+            .map(|(_, b)| (b.rect, b.size, Item::Para(b, level(b, body))))
             .collect();
-        parts.extend(tables.into_iter().map(|t| (t.rect[3], t.rect[0], Item::Table(t))));
-        parts.extend(p.images.iter().map(|im| (im.rect[3], im.rect[0], Item::Img(im))));
-        parts.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
-        out.extend(parts.into_iter().map(|x| x.2));
+        parts.extend(tables.into_iter().map(|t| (t.rect, body, Item::Table(t))));
+        parts.extend(p.images.iter().map(|im| (im.rect, (im.rect[3] - im.rect[1]).max(body), Item::Img(im))));
+        out.extend(reading_order(p, parts));
     }
     out
 }
@@ -1540,5 +1646,78 @@ mod tests {
         let zip = docx(&[p], "T");
         let rels = part(&zip, "word/_rels/document.xml.rels");
         assert_eq!(rels.matches("relationships/image\"").count(), MAX_MEDIA);
+    }
+
+    /// #3657: two-column text finishes the left column before starting the right column across
+    /// Word, HTML, RTF and PowerPoint, and text turned 90° exports in reading order rather than
+    /// last line first.
+    #[test]
+    fn two_column_and_turned_text_export_in_reading_order() {
+        let para = |t: &str, x: f64, y0: f64, y1: f64, size: f64| Block {
+            text: t.into(),
+            rect: [x, y0, x + 130.0, y1],
+            size,
+            bold: false,
+            italic: false,
+            color: [0.0; 3],
+            rotation: 0.0,
+        };
+        let columns = Page {
+            width: 595.0,
+            height: 842.0,
+            blocks: vec![
+                para("Two columns", 50.0, 790.0, 808.0, 18.0),
+                para("A1 first paragraph A2 first paragraph A3 first paragraph", 50.0, 720.0, 762.0, 12.0),
+                para("B1 second paragraph B2 second paragraph", 50.0, 675.0, 702.0, 12.0),
+                para("B3 second paragraph B4 second paragraph", 320.0, 735.0, 762.0, 12.0),
+                para("C1 third paragraph C2 third paragraph", 320.0, 695.0, 722.0, 12.0),
+            ],
+            images: Vec::new(),
+            background: None,
+        };
+        let expected_cols = ["Two columns", "A1 first paragraph", "B1 second paragraph", "B3 second paragraph", "C1 third paragraph"];
+        for (fmt, out) in [
+            ("html", html(std::slice::from_ref(&columns), "Columns")),
+            ("docx", part(&docx(std::slice::from_ref(&columns), "Columns"), "word/document.xml")),
+            ("rtf", rtf(std::slice::from_ref(&columns))),
+            ("pptx", part(&pptx(std::slice::from_ref(&columns), "Columns"), "ppt/slides/slide1.xml")),
+        ] {
+            let positions: Vec<usize> = expected_cols.iter().map(|s| out.find(s).unwrap_or_else(|| panic!("{s} missing in {fmt}: {out}"))).collect();
+            assert!(positions.windows(2).all(|w| w[0] < w[1]), "{fmt} out of order: {positions:?}\n{out}");
+        }
+
+        // Text turned 90 degrees clockwise (rotation = -90°): lines run top to bottom (y = 540
+        // down to 468) and follow each other right to left (x = 676, 654.4, 632.8, 611.2).
+        let turned_line = |t: &str, x: f64| Block {
+            text: t.into(),
+            rect: [x - 18.0, 468.0, x, 540.0],
+            size: 18.0,
+            bold: false,
+            italic: false,
+            color: [0.0; 3],
+            rotation: -90.0,
+        };
+        let rotated = Page {
+            width: 792.0,
+            height: 612.0,
+            blocks: vec![
+                turned_line("Line one", 676.0),
+                turned_line("Line two", 654.4),
+                turned_line("Line three", 632.8),
+                turned_line("Line four", 611.2),
+            ],
+            images: Vec::new(),
+            background: None,
+        };
+        let expected_lines = ["Line one", "Line two", "Line three", "Line four"];
+        for (fmt, out) in [
+            ("html", html(std::slice::from_ref(&rotated), "Rotated")),
+            ("docx", part(&docx(std::slice::from_ref(&rotated), "Rotated"), "word/document.xml")),
+            ("rtf", rtf(std::slice::from_ref(&rotated))),
+            ("pptx", part(&pptx(std::slice::from_ref(&rotated), "Rotated"), "ppt/slides/slide1.xml")),
+        ] {
+            let positions: Vec<usize> = expected_lines.iter().map(|s| out.find(s).unwrap_or_else(|| panic!("{s} missing in {fmt}: {out}"))).collect();
+            assert!(positions.windows(2).all(|w| w[0] < w[1]), "{fmt} out of order: {positions:?}\n{out}");
+        }
     }
 }

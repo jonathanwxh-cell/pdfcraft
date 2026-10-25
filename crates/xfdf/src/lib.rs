@@ -419,6 +419,13 @@ fn xfdf_annots(doc: &Document, out: &mut String) {
     }
 }
 
+/// Whether field `f` is included in exported form data: push buttons, signatures and text fields
+/// with the Password flag (`bNoPassword` in Acrobat's `exportAsFDF` / `exportAsXFDF`, #3945) are
+/// left out.
+fn is_exportable_field(f: &pdfcraft_forms::Field) -> bool {
+    !matches!(f.kind, FieldKind::PushButton | FieldKind::Signature) && !(f.kind == FieldKind::Text && f.has(pdfcraft_forms::flags::PASSWORD))
+}
+
 /// Field values as nested XFDF `<field>` elements.
 fn xfdf_fields(doc: &Document, out: &mut String) {
     #[derive(Default)]
@@ -428,7 +435,7 @@ fn xfdf_fields(doc: &Document, out: &mut String) {
     }
     let mut root = Node::default();
     for f in pdfcraft_forms::fields(doc) {
-        if matches!(f.kind, FieldKind::PushButton | FieldKind::Signature) {
+        if !is_exportable_field(&f) {
             continue;
         }
         let mut node = &mut root;
@@ -698,7 +705,7 @@ pub fn export_fdf(doc: &Document, comments: bool, fields: bool, file: &str) -> R
     if fields {
         body.extend_from_slice(b"/Fields [");
         for f in pdfcraft_forms::fields(doc) {
-            if matches!(f.kind, FieldKind::PushButton | FieldKind::Signature) {
+            if !is_exportable_field(&f) {
                 continue;
             }
             // Field dictionary, /T string and /V scalar/array, plus every emitted list
@@ -843,7 +850,7 @@ fn xml_name(name: &str) -> String {
 pub fn export_data(doc: &Document, format: Format) -> String {
     let fields: Vec<(String, String)> = pdfcraft_forms::fields(doc)
         .into_iter()
-        .filter(|f| !matches!(f.kind, FieldKind::PushButton | FieldKind::Signature))
+        .filter(is_exportable_field)
         .map(|f| {
             let v = match f.kind {
                 FieldKind::CheckBox | FieldKind::Radio if f.value.is_empty() => "Off".to_string(),
@@ -1365,7 +1372,7 @@ pub fn data_values(bytes: &[u8]) -> Result<Vec<(String, Vec<String>)>, DataError
         let doc = Document::open(std::sync::Arc::new(bytes.to_vec())).map_err(|e| DataError::Malformed(e.to_string()))?;
         return Ok(pdfcraft_forms::fields(&doc)
             .into_iter()
-            .filter(|f| !matches!(f.kind, FieldKind::PushButton | FieldKind::Signature))
+            .filter(is_exportable_field)
             .map(|f| {
                 let v =
                     if matches!(f.kind, FieldKind::CheckBox | FieldKind::Radio) && f.value.is_empty() { vec!["Off".to_string()] } else { f.value };

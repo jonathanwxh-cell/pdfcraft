@@ -1471,12 +1471,27 @@ fn datasets_packet(doc: &Document) -> Result<Option<String>, XfaError> {
 /// The data to export, as Acrobat's Export Data writes it: `xdp` false gives an XML document
 /// holding the data alone (the form's root data node at the root, or the data element when
 /// there are several); true gives an XDP holding the whole datasets and a reference to the
-/// PDF, named `pdf_name`. A document whose packets can't be read is an error, not empty data.
+/// PDF, named `pdf_name`. Typed password field values (`<passwordEdit/>` or `/Ff` bit 14) are
+/// cleared back to their template default (or empty) in the exported markup (#3945). A document
+/// whose packets can't be read is an error, not empty data.
 pub fn export_data(doc: &Document, xdp: bool, pdf_name: &str) -> Result<String, XfaError> {
     if crate::read_packets(doc)?.is_none() {
         return Err(XfaError::NotXfa);
     }
-    let packet = datasets_packet(doc)?;
+    let packet = match datasets_packet(doc)? {
+        Some(text) => {
+            let wants = password_dataset_wants(doc);
+            if wants.is_empty() {
+                Some(text)
+            } else {
+                Some(
+                    merge_all(&text, Within::Packet, &[Op::Values(&wants)], &mut Vec::new())
+                        .ok_or_else(|| XfaError::Malformed("the XFA data could not be read".into()))?,
+                )
+            }
+        }
+        None => None,
+    };
     let (datasets, data) = match &packet {
         Some(text) => match datasets_markup(text) {
             Ok(Some(m)) => m,

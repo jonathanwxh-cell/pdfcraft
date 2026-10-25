@@ -1,6 +1,6 @@
 # PdfCraft roadmap
 
-> **Last reviewed:** 2026-10-25 · **Last updated:** 2026-10-25 · **Change:** patch (M6, #3945: XFA exports scan wrapped packets and reject partial password redaction; estimates unchanged)
+> **Last reviewed:** 2026-10-25 · **Last updated:** 2026-10-25 · **Change:** patch (M6, #3945: XFA exports scan wrapped packets and reject truncated scans or partial password redaction; estimates unchanged)
 
 
 **Stage: alpha** · next: beta, ~25% (ready for real work 50% → 75%) and ~400–700 h away
@@ -202,7 +202,7 @@ Ranked; detail and the full milestone table in [docs/roadmap.md](docs/roadmap.md
 
 ## Progress log
 
-- **2026-10-25 (M6, #3945):** XFA XML/XDP exports scan the exact normalized datasets, reject unreadable templates and incomplete password redaction, and preserve ordinary-field namespace roundtrips. Synthetic wrapper, malformed-input and structured-password regressions added. Local test execution is blocked by build-disk capacity; CI validation remains required. Estimates unchanged.
+- **2026-10-25 (M6, #3945):** XFA XML/XDP exports scan the exact normalized datasets, reject unreadable templates and incomplete password redaction, and preserve ordinary-field namespace roundtrips. Synthetic wrapper, malformed-input, structured-password, depth/node-budget and SOM-index boundary regressions added. Local test execution is blocked by build-disk capacity; CI validation remains required. Estimates unchanged.
 
 - **2026-10-24 (M14, #4253):** The annotation quick bar remembers Keep tool selected across restarts, including unpinning. Old and malformed settings keep safe defaults; the opt-in UI control channel reads and changes the same preference. Estimates unchanged.
 
@@ -679,7 +679,7 @@ Newest first: the date, what moved, and the new overall estimate.
 
 ## Revision history
 
-**2026-10-25 · patch:** M6/#3945: scan the normalized XFA export data and fail closed on incomplete password redaction; local execution blocked by build-disk capacity, CI validation pending. Estimates unchanged.
+**2026-10-25 · patch:** M6/#3945: scan the normalized XFA export data and fail closed on incomplete password redaction or bounded scans, including dataset/template/field depth, traversal budgets and unsupported SOM indices. Boundary regressions cover XML/XDP; local linked execution is blocked by build-disk capacity. Estimates unchanged.
 
 **2026-10-15 · minor:** M14/#2383 candidate: GPU device requests clamp unsupported limits while retaining the adapter texture extent. Synthetic V3D/downlevel regressions and Windows GPU-required tests pass; Raspberry Pi hardware remains unverified. Estimates unchanged.
 

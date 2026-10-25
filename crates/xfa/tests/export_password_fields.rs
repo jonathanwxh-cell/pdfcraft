@@ -166,3 +166,127 @@ fn xfa_export_data_scans_wrapped_array_packets() {
         assert!(exported.contains("<user>Ada</user>") && exported.contains("<preset>0000</preset>"), "{exported}");
     }
 }
+
+fn static_password_document(data: &str, som: &str, depth: usize) -> Document {
+    let text = format!("<xfa:datasets xmlns:xfa=\"http://www.xfa.org/schema/xfa-data/1.0/\"><xfa:data>{data}</xfa:data></xfa:datasets>");
+    let mut doc = Document::open(Arc::new(xfa_shell(&text))).unwrap();
+    let mut field = doc.add(Object::Dict(
+        [(b"FT".to_vec(), Object::name("Tx")), (b"Ff".to_vec(), Object::Int(1 << 13)), (b"T".to_vec(), Object::String(PdfString::text(som)))]
+            .into_iter()
+            .collect(),
+    ));
+    for _ in 0..depth {
+        field = doc.add(Object::Dict([(b"Kids".to_vec(), Object::Array(vec![Object::Ref(field)]))].into_iter().collect()));
+    }
+    let root = doc.root().unwrap();
+    let mut catalog = doc.get(root).as_dict().unwrap().clone();
+    let mut acro = catalog.get(b"AcroForm").unwrap().as_dict().unwrap().clone();
+    acro.set(b"Fields".to_vec(), Object::Array(vec![Object::Ref(field)]));
+    catalog.set(b"AcroForm".to_vec(), Object::Dict(acro));
+    doc.set(root, Object::Dict(catalog));
+    doc
+}
+
+fn assert_password_scan_boundary(doc: &Document, complete: bool) {
+    let before = write_full(doc, &SaveOptions::default()).unwrap();
+    for xdp in [false, true] {
+        let result = export_data(doc, xdp, "form.pdf");
+        if complete {
+            let exported = result.unwrap();
+            assert!(!exported.contains("boundary-secret"), "{exported}");
+        } else {
+            assert!(matches!(result, Err(pdfcraft_xfa::XfaError::Malformed(_))), "a truncated scan must refuse export");
+        }
+    }
+    assert_eq!(write_full(doc, &SaveOptions::default()).unwrap(), before, "export never changes the original packets");
+}
+
+#[test]
+fn xfa_export_data_rejects_dataset_depth_truncation() {
+    for depth in [63, 64] {
+        let data = format!("{}<pin>boundary-secret</pin>{}", "<n>".repeat(depth), "</n>".repeat(depth));
+        let som = format!("{}pin[0]", "n[0].".repeat(depth));
+        let doc = static_password_document(&data, &som, 0);
+        assert_password_scan_boundary(&doc, depth == 63);
+    }
+}
+
+#[test]
+fn xfa_export_data_rejects_template_depth_truncation() {
+    for depth in [63, 64] {
+        let fields = format!("{}<field name=\"pin\"><ui><passwordEdit/></ui></field>{}", "<subform>".repeat(depth), "</subform>".repeat(depth));
+        let text = format!(
+            "<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><template><subform name=\"form\">{fields}</subform></template><datasets><data><form><pin>boundary-secret</pin></form></data></datasets></xdp:xdp>"
+        );
+        let doc = Document::open(Arc::new(xfa_shell(&text))).unwrap();
+        assert_password_scan_boundary(&doc, depth == 63);
+    }
+}
+
+#[test]
+fn xfa_export_data_rejects_truncated_page_sets() {
+    let text = format!(
+        "<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><template><subform name=\"form\">{}<pageArea name=\"master\"><field name=\"pin\"><ui><passwordEdit/></ui></field></pageArea>{}</subform></template><datasets><data><master><pin>boundary-secret</pin></master></data></datasets></xdp:xdp>",
+        "<pageSet>".repeat(65),
+        "</pageSet>".repeat(65)
+    );
+    let doc = Document::open(Arc::new(xfa_shell(&text))).unwrap();
+    assert_password_scan_boundary(&doc, false);
+}
+
+#[test]
+fn xfa_export_data_rejects_password_sibling_budget_truncation() {
+    for draws in [pdfcraft_xfa::MAX_FORM_NODES - 2, pdfcraft_xfa::MAX_FORM_NODES - 1] {
+        let text = format!(
+            "<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><template><subform name=\"form\">{}<field name=\"pin\"><ui><passwordEdit/></ui></field></subform></template><datasets><data><form><pin>boundary-secret</pin></form></data></datasets></xdp:xdp>",
+            "<draw/>".repeat(draws)
+        );
+        let doc = Document::open(Arc::new(xfa_shell(&text))).unwrap();
+        assert_password_scan_boundary(&doc, draws == pdfcraft_xfa::MAX_FORM_NODES - 2);
+    }
+}
+
+#[test]
+fn xfa_export_data_rejects_password_child_budget_truncation() {
+    let text = format!(
+        "<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><template><subform name=\"form\">{}<subform><field name=\"pin\"><ui><passwordEdit/></ui></field></subform></subform></template><datasets><data><form><pin>boundary-secret</pin></form></data></datasets></xdp:xdp>",
+        "<draw/>".repeat(pdfcraft_xfa::MAX_FORM_NODES - 2)
+    );
+    let doc = Document::open(Arc::new(xfa_shell(&text))).unwrap();
+    assert_password_scan_boundary(&doc, false);
+}
+
+#[test]
+fn xfa_export_data_rejects_password_instance_budget_truncation() {
+    let text = r#"<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/"><template><subform name="form">
+<field name="pin"><ui><passwordEdit/></ui></field>
+<subform name="row"><occur initial="1000" max="-1"/><subform name="cell"><occur initial="1000" max="-1"/></subform></subform>
+</subform></template>
+<datasets><data><form><pin>boundary-secret</pin></form></data></datasets></xdp:xdp>"#;
+    let doc = Document::open(Arc::new(xfa_shell(text))).unwrap();
+    assert_password_scan_boundary(&doc, false);
+}
+
+#[test]
+fn xfa_export_data_rejects_static_password_depth_truncation() {
+    for depth in [32, 33] {
+        let doc = static_password_document("<form><pin>boundary-secret</pin></form>", "form[0].pin[0]", depth);
+        assert_password_scan_boundary(&doc, depth == 32);
+    }
+}
+
+#[test]
+fn xfa_export_data_rejects_clamped_password_indices() {
+    for index in [100_000, 100_001] {
+        let data = format!("<form>{}<pin>boundary-secret</pin></form>", "<pin/>".repeat(index));
+        let doc = static_password_document(&data, &format!("form[0].pin[{index}]"), 0);
+        assert_password_scan_boundary(&doc, index == 100_000);
+        // Same-named ordinary draws still advance the final password field's SOM index.
+        let text = format!(
+            "<xdp:xdp xmlns:xdp=\"http://ns.adobe.com/xdp/\"><template><subform name=\"form\">{}<field name=\"pin\"><ui><passwordEdit/></ui></field></subform></template><datasets><data>{data}</data></datasets></xdp:xdp>",
+            "<draw name=\"pin\"/>".repeat(index)
+        );
+        let doc = Document::open(Arc::new(xfa_shell(&text))).unwrap();
+        assert_password_scan_boundary(&doc, index == 100_000);
+    }
+}

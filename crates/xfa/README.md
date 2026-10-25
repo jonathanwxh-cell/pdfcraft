@@ -56,7 +56,8 @@ that warning and keeps the existing layout and accepted widget values.
   document's warnings), the packet after every form edit.
   XML/XDP data exports clear typed password values without changing the open document.
   Wrapped packets use the same parsed data for scanning and export; unreadable password
-  declarations or incomplete redaction (including structured password nodes) refuse the export.
+  declarations, incomplete bounded scans, or incomplete redaction (including structured password
+  nodes) refuse the export. Password SOM indices beyond the supported range are not aliased.
 
 Layout measures each container once per (node, width): width-less containers would otherwise
 be measured exponentially often in their nesting. A measurement budget backs this up.

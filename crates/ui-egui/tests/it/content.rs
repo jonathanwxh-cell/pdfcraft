@@ -1051,3 +1051,60 @@ fn added_picture_resizes_repeatedly_and_drags_back_from_out_of_bounds_without_sm
     h.drop_at(grab + shift);
     crate::support::settle(&mut h);
 }
+
+/// A short page leaves empty window under the scroll content. A handle dragged into that
+/// margin has to start another resize after the pointer is released.
+#[test]
+fn a_handle_in_the_viewport_below_a_short_page_starts_another_resize() {
+    let _gpu = gpu();
+    let mut h = harness();
+    h.state_mut().set_option("zoom", "50").unwrap();
+    assert!(h.state_mut().execute("edit.edit_text"));
+    h.run_steps(2);
+    let mut png = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png, 60, 60);
+        enc.set_color(png::ColorType::Rgb);
+        let mut w = enc.write_header().unwrap();
+        w.write_image_data(&[200u8, 30, 30].repeat(3600)).unwrap();
+    }
+    h.state_mut().add_image("red.png".into(), png);
+    h.run_steps(3);
+    let img = match &added(&h)[0].content {
+        pdfcraft_engine::AddedContent::Image(i) => pdfcraft_engine::AddedImage { rect: [40.0, 0.0, 100.0, 40.0], ..i.clone() },
+        _ => panic!("added an image"),
+    };
+    assert!(h.state_mut().apply_edit(pdfcraft_engine::Edit::UpdateContent { page: 0, index: 0, content: pdfcraft_engine::AddedContent::Image(img) }));
+    h.run_steps(3);
+    let page = h.state().views[0].page_screen_rect(0).unwrap();
+    let grip = item_on_screen(&h, [40.0, 0.0, 100.0, 40.0]).expand(1.0).right_bottom();
+    let below = pos2(grip.x, page.bottom() + 80.0);
+    assert!(below.y < 880.0, "the margin point stays in the window: {below:?}");
+    h.hover_at(grip);
+    h.run_steps(1);
+    h.drag_at(grip);
+    h.run_steps(1);
+    for k in 1..=4 {
+        h.hover_at(grip + (below - grip) * (k as f32 / 4.0));
+        h.run_steps(1);
+    }
+    h.drop_at(below);
+    h.run_steps(3);
+    let pulled = added(&h)[0].content.rect();
+    assert!(pulled[1] < -5.0, "the first drag leaves the page: {pulled:?}");
+    let grip2 = item_on_screen(&h, pulled).expand(1.0).right_bottom();
+    assert!(grip2.y > page.bottom() + 40.0, "the handle is below the page margin: grip {grip2:?} page {page:?}");
+    let to = pos2(grip2.x, grip2.y - 36.0);
+    h.hover_at(grip2);
+    h.run_steps(1);
+    h.drag_at(grip2);
+    h.run_steps(1);
+    for k in 1..=4 {
+        h.hover_at(grip2 + (to - grip2) * (k as f32 / 4.0));
+        h.run_steps(1);
+    }
+    h.drop_at(to);
+    h.run_steps(3);
+    let again = added(&h)[0].content.rect();
+    assert!(again[1] > pulled[1] + 5.0, "the second press never started a resize: {pulled:?} -> {again:?}");
+}

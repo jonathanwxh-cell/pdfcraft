@@ -394,11 +394,19 @@ mod tests {
     fn canonical_components_are_compared_exactly() {
         let (base, _) = folders("canonical-exact");
         std::fs::create_dir_all(base.join("ink")).unwrap();
-        std::fs::create_dir_all(base.join("in\u{212A}")).unwrap();
-        std::fs::write(base.join("in\u{212A}/secret.pdf"), "x").unwrap();
-        let roots = AutomationRoots::new(Some(&base.join("ink")), None).unwrap().unwrap();
-        let e = roots.check(&s(base.join("in\u{212A}/secret.pdf")), Access::Read).unwrap_err();
-        assert!(e.starts_with("automation path rejected: outside the read root"), "{e}");
+        let kelvin = base.join("in\u{212A}");
+        std::fs::create_dir_all(&kelvin).unwrap();
+        std::fs::write(kelvin.join("secret.pdf"), "x").unwrap();
+        // U+212A folds to K. A case-insensitive volume stores both names as one directory, so
+        // `check` would be asked to reject a path inside its own root. The component comparison
+        // itself does not need that volume.
+        let distinct = base.join("ink").canonicalize().ok() != kelvin.canonicalize().ok();
+        if distinct {
+            let roots = AutomationRoots::new(Some(&base.join("ink")), None).unwrap().unwrap();
+            let e = roots.check(&s(kelvin.join("secret.pdf")), Access::Read).unwrap_err();
+            assert!(e.starts_with("automation path rejected: outside the read root"), "{e}");
+        }
+        assert!(!inside(Path::new("/work/in\u{212A}/secret.pdf"), Path::new("/work/ink")));
         assert!(!inside(Path::new(r"\\?\C:\work\IN\a.pdf"), Path::new(r"\\?\C:\work\in")));
         #[cfg(windows)]
         {

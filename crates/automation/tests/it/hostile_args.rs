@@ -226,6 +226,20 @@ fn empty_dir(dir: &Path) {
     }
 }
 
+/// `action_run` keeps going when one input path is refused and reports that refusal on the file.
+/// That is still a confinement refusal: every file has an error naming the boundary, and none
+/// has an output.
+fn per_file_confinement_refusal(content: &[pdfcraft_automation::Content]) -> bool {
+    let Some(files) = content.iter().find_map(|c| match c {
+        pdfcraft_automation::Content::Json(v) => v.get("files").and_then(Value::as_array),
+        pdfcraft_automation::Content::Png { .. } => None,
+    }) else {
+        return false;
+    };
+    !files.is_empty()
+        && files.iter().all(|file| file.get("output").is_none() && file.get("error").and_then(Value::as_str).is_some_and(|e| e.contains("outside")))
+}
+
 /// Real values for the arguments a tool checks before the others, so a hostile value reaches the
 /// argument it is meant for instead of failing on a placeholder. `sign_document` checks its
 /// digital ID first and its document second: this ID opens with its password, and each call gets
@@ -238,6 +252,12 @@ fn fixture(a: &mut Automation, root: &Path, tool: &str) -> serde_json::Map<Strin
             std::fs::copy(&id, root.join("id.p12")).expect("copy the test digital ID");
             let doc = blank_doc(a);
             let args = json!({ "doc": doc, "id": "id.p12", "password": "test", "out": "signed.pdf" });
+            args.as_object().cloned().unwrap_or_default()
+        }
+        // Without a step, action_run returns "give action or steps" before it resolves folder
+        // or paths, and that error would be counted as a confinement refusal.
+        "action_run" => {
+            let args = json!({ "steps": [{ "step": "set_title", "arg": "Confined" }] });
             args.as_object().cloned().unwrap_or_default()
         }
         _ => serde_json::Map::new(),
@@ -340,6 +360,9 @@ fn no_tool_escapes_the_root() {
                     match catch_unwind(AssertUnwindSafe(|| a.call(def.name, &args))) {
                         // A path that leaves the root must be refused. Succeeding means the tool
                         // either used it or ignored an argument it declares — both are faults.
+                        // action_run reports a refused input inside an otherwise successful
+                        // result, one error per file, and writes nothing for that file.
+                        Ok(Ok(content)) if per_file_confinement_refusal(&content) => refused += 1,
                         Ok(Ok(_)) => leaked.push(format!("{mode}: {} accepted {prop}={escape:?}", def.name)),
                         Ok(Err(_)) => refused += 1,
                         Err(_) => leaked.push(format!("{mode}: {} panicked on {prop}={escape:?}", def.name)),

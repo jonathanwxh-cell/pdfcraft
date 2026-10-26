@@ -204,6 +204,8 @@ pub struct SearchDraft {
     pub pattern: RedactPattern,
     /// The result of the last search (matches marked), shown in the dialog.
     pub found: Option<usize>,
+    /// Whether the last search stopped at the match limit.
+    pub capped: bool,
 }
 
 impl Default for SearchDraft {
@@ -216,12 +218,16 @@ impl Default for SearchDraft {
             whole_words: false,
             pattern: RedactPattern::Phone,
             found: None,
+            capped: false,
         }
     }
 }
 
 /// The largest word list file Import list accepts.
 pub(crate) const MAX_WORD_LIST_BYTES: usize = 1 << 20;
+
+/// The most matches Find text and redact marks in one search.
+pub const MAX_SEARCH_MATCHES: usize = 10_000;
 
 /// A box being drawn with the Redact tool: (page, start).
 pub type AreaDrag = Option<(usize, Pos2)>;
@@ -298,8 +304,15 @@ pub(crate) fn paint(painter: &egui::Painter, page: usize, view: &DocView, pointe
 }
 
 impl PdfCraftApp {
-    /// Mark every match of the search draft on every page; returns how many were marked.
+    /// Mark every match of the search draft on every page, up to [`MAX_SEARCH_MATCHES`]; returns
+    /// how many were marked.
     pub fn redact_search(&mut self) -> usize {
+        self.redact_search_up_to(MAX_SEARCH_MATCHES)
+    }
+
+    /// Mark every match of the search draft across pages, stopping once `max_matches` are marked.
+    pub fn redact_search_up_to(&mut self, max_matches: usize) -> usize {
+        self.redact_search.capped = false;
         let Some((_, id)) = self.active_ids() else { return 0 };
         let Some(doc) = self.session.get(id) else { return 0 };
         let d = self.redact_search.clone();
@@ -308,14 +321,16 @@ impl PdfCraftApp {
             SearchMode::Words => pdfcraft_engine::redact_word_list(&d.words),
             SearchMode::Phrase | SearchMode::Patterns => Vec::new(),
         };
-        if d.mode != SearchMode::Patterns && needles.is_empty() {
+        if (d.mode != SearchMode::Patterns && needles.is_empty()) || max_matches == 0 {
+            self.redact_search.found = Some(0);
             return 0;
         }
         let config = pdfcraft_render::RenderConfig { password: doc.password.as_deref().map(std::sync::Arc::from), ..Default::default() };
         let mut r = pdfcraft_render::PageRenderer::new(doc.bytes.clone(), config);
         let mut edits = Vec::new();
+        let mut capped = false;
         let author = self.comment_prefs.author.clone();
-        for (page, page_info) in doc.info.pages.iter().enumerate() {
+        'pages: for (page, page_info) in doc.info.pages.iter().enumerate() {
             let out = r.render(pdfcraft_render::RenderRequest { page, kind: pdfcraft_render::RequestKind::Text, scale: 1.0, ..Default::default() });
             let Some(text) = out.text else { continue };
             let hits = match d.mode {
@@ -326,10 +341,16 @@ impl PdfCraftApp {
                 let quads: Vec<[f64; 8]> = text.line_rects(h).into_iter().map(|r| page_info.view_rect_to_quad(r)).collect();
                 if !quads.is_empty() {
                     edits.push(self.redact_prefs.mark(page, quads, &author));
+                    if edits.len() >= max_matches {
+                        capped = true;
+                        break 'pages;
+                    }
                 }
             }
         }
         let n = edits.len();
+        self.redact_search.found = Some(n);
+        self.redact_search.capped = capped;
         if n > 0 {
             self.apply_edit(Edit::Batch { label: "Mark for redaction".into(), edits });
         }
@@ -424,6 +445,8 @@ pub(crate) fn search_body(ui: &mut egui::Ui, d: &mut SearchDraft, t: &Tokens) ->
         ui.label(
             egui::RichText::new(if n == 0 {
                 tl!("No matches.").to_string()
+            } else if d.capped {
+                crate::i18n::fmt(tl!("First {n} matches marked for redaction (limit reached)."), &[("n", &n.to_string())])
             } else {
                 crate::i18n::fmt(tl!("{n} match(es) marked for redaction."), &[("n", &n.to_string())])
             })

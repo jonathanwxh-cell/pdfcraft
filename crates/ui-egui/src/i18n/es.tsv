@@ -2854,3 +2854,9 @@ theme	Appearance	Aspecto
 
 # Date picker: Today button (#4274) (AI-assisted, not separately native-reviewed)
 	Today	Hoy
+	Inserted page	Página insertada
+	Deleted page	Página eliminada
+	Moved page	Página movida
+	Page {old} → Page {new}	Página {old} → página {new}
+	+ Page {p}	+ Página {p}
+	− Page {p}	− Página {p}

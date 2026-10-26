@@ -145,9 +145,18 @@ pub(crate) fn panel(ui: &mut egui::Ui, t: &Tokens, state: &Option<CompareState>,
     ui.separator();
     for (pi, pc) in c.page_changes.iter().enumerate() {
         let (kind, page, text) = match pc.kind {
-            PageKind::Moved => (Kind::Replaced, pc.new_page, format!("Page {} → Page {}", pc.old_page + 1, pc.new_page + 1)),
-            PageKind::Inserted => (Kind::Inserted, pc.new_page, format!("+ Page {}", pc.new_page + 1)),
-            PageKind::Deleted => (Kind::Deleted, pc.old_page, format!("− Page {}", pc.old_page + 1)),
+            PageKind::Moved => (
+                Kind::Replaced,
+                pc.new_page,
+                crate::i18n::fmt(tl!("Page {old} → Page {new}"), &[("old", &(pc.old_page + 1).to_string()), ("new", &(pc.new_page + 1).to_string())]),
+            ),
+            PageKind::Inserted => (Kind::Inserted, pc.new_page, crate::i18n::fmt(tl!("+ Page {p}"), &[("p", &(pc.new_page + 1).to_string())])),
+            PageKind::Deleted => (Kind::Deleted, pc.old_page, crate::i18n::fmt(tl!("− Page {p}"), &[("p", &(pc.old_page + 1).to_string())])),
+        };
+        let kind_label = match pc.kind {
+            PageKind::Inserted => tl!("Inserted page"),
+            PageKind::Deleted => tl!("Deleted page"),
+            PageKind::Moved => tl!("Moved page"),
         };
         let r = ui.push_id(("page-change", pi), |ui| {
             ui.horizontal(|ui| {
@@ -155,12 +164,9 @@ pub(crate) fn panel(ui: &mut egui::Ui, t: &Tokens, state: &Option<CompareState>,
                 ui.painter().rect_filled(bar, egui::CornerRadius::same(2), colour(kind));
                 ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new(crate::i18n::fmt(
-                            tl!("{kind} · page {p}"),
-                            &[("kind", tl!(pc.kind.label())), ("p", &(page + 1).to_string())],
-                        ))
-                        .small()
-                        .color(t.text_muted),
+                        egui::RichText::new(crate::i18n::fmt(tl!("{kind} · page {p}"), &[("kind", kind_label), ("p", &(page + 1).to_string())]))
+                            .small()
+                            .color(t.text_muted),
                     );
                     ui.selectable_label(false, text)
                 })

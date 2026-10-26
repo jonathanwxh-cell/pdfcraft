@@ -2763,3 +2763,9 @@ certificate	SHA-256 digest	Impronta SHA-256
 
 # Date picker: Today button (#4274) (AI-assisted, not separately native-reviewed)
 	Today	Oggi
+	Inserted page	Pagina inserita
+	Deleted page	Pagina eliminata
+	Moved page	Pagina spostata
+	Page {old} → Page {new}	Pagina {old} → pagina {new}
+	+ Page {p}	+ Pagina {p}
+	− Page {p}	− Pagina {p}

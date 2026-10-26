@@ -2801,3 +2801,9 @@ theme	Appearance	Teema
 	Attaching files is not available on the web yet	Tiedostojen liittäminen ei ole vielä käytettävissä verkossa
 	Delete attachment	Poista liite
 	Delete attachment {key}	Poista liite {key}
+	Inserted page	Lisätty sivu
+	Deleted page	Poistettu sivu
+	Moved page	Siirretty sivu
+	Page {old} → Page {new}	Sivu {old} → sivu {new}
+	+ Page {p}	+ Sivu {p}
+	− Page {p}	− Sivu {p}

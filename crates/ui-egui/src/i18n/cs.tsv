@@ -2838,3 +2838,9 @@ certificate	Version	Verze
 
 # Date picker: Today button (#4274) (AI-assisted, not separately native-reviewed)
 	Today	Dnes
+	Inserted page	Vložená stránka
+	Deleted page	Odstraněná stránka
+	Moved page	Přesunutá stránka
+	Page {old} → Page {new}	Stránka {old} → stránka {new}
+	+ Page {p}	+ Stránka {p}
+	− Page {p}	− Stránka {p}

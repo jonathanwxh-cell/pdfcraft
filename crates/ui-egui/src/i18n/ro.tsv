@@ -2792,3 +2792,9 @@ theme	Appearance	Aspect
 	Attaching files is not available on the web yet	Atașarea fișierelor nu este încă disponibilă pe web
 	Delete attachment	Ștergere atașament
 	Delete attachment {key}	Ștergere atașament {key}
+	Inserted page	Pagină inserată
+	Deleted page	Pagină ștearsă
+	Moved page	Pagină mutată
+	Page {old} → Page {new}	Pagina {old} → pagina {new}
+	+ Page {p}	+ Pagina {p}
+	− Page {p}	− Pagina {p}

@@ -2627,3 +2627,9 @@ animation effects	Off	Wyłączone
 
 # Date picker: Today button (#4274) (AI-assisted, not separately native-reviewed)
 	Today	Dzisiaj
+	Inserted page	Wstawiona strona
+	Deleted page	Usunięta strona
+	Moved page	Przeniesiona strona
+	Page {old} → Page {new}	Strona {old} → strona {new}
+	+ Page {p}	+ Strona {p}
+	− Page {p}	− Strona {p}

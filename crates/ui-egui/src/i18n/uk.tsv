@@ -2553,3 +2553,9 @@ animation effects	Off	Вимкнено
 
 # Date picker: Today button (#4274) (AI-assisted, not separately native-reviewed)
 	Today	Сьогодні
+	Inserted page	Вставлена сторінка
+	Deleted page	Видалена сторінка
+	Moved page	Переміщена сторінка
+	Page {old} → Page {new}	Сторінка {old} → сторінка {new}
+	+ Page {p}	+ Сторінка {p}
+	− Page {p}	− Сторінка {p}

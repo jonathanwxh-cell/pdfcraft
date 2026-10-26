@@ -2627,3 +2627,4 @@ animation effects	Off	Wyłączone
 
 # Date picker: Today button (#4274) (AI-assisted, not separately native-reviewed)
 	Today	Dzisiaj
+	Automatic AcroForm scripts are disabled until safe execution isolation is available; saved field values were preserved. Explicit button and console scripts are still available.	Automatyczne skrypty AcroForm są wyłączone, dopóki nie będzie bezpiecznej izolacji wykonania; zapisane wartości pól zostały zachowane. Skrypty przycisków i konsoli nadal są dostępne.

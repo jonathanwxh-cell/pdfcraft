@@ -4758,6 +4758,45 @@ fn form_open_scripts_do_not_start_calculations() {
 }
 
 #[test]
+fn page_open_script_sets_the_notice_and_field_scripts_do_not() {
+    let page_open = {
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 300] >>",
+            "<< /Type /Page /Parent 2 0 R /AA << /O << /S /JavaScript /JS (app.alert\\('open'\\);) >> >> >>",
+        ];
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for o in offsets {
+            pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+        pdf
+    };
+    let mut s = Session::new();
+    let id = s.open("page-open.pdf", None, Arc::new(page_open), None).unwrap();
+    assert!(s.get(id).unwrap().info.warnings.iter().any(|w| w == js::OPEN_SCRIPTS_SKIPPED), "a page /AA /O script is an open script");
+
+    let id = s.open("fields.pdf", None, Arc::new(fixture(1)), None).unwrap();
+    s.apply(id, Edit::AddField { page: 0, rect: [20.0, 40.0, 180.0, 62.0], kind: NewField::Text { multiline: false }, name: Some("city".into()) })
+        .unwrap();
+    s.apply(id, Edit::SetFieldScript { name: "city".into(), event: "validate".into(), script: Some("event.rc = true;".into()) }).unwrap();
+    let bytes = s.save_bytes(id).unwrap();
+    let id = s.open("fields.pdf", None, bytes, None).unwrap();
+    assert!(
+        !s.get(id).unwrap().info.warnings.iter().any(|w| w == js::OPEN_SCRIPTS_SKIPPED),
+        "field scripts are not open scripts: {:?}",
+        s.get(id).unwrap().info.warnings
+    );
+}
+
+#[test]
 fn form_open_scripts_do_not_evaluate_throwing_scripts() {
     let bytes = form_with_open_script(
         "if (event.name == 'Open') getField('price').value = 7; if (event.name == 'Calculate') throw new Error('calculation failed');",

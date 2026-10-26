@@ -223,13 +223,15 @@ impl Scripts for JsRunner {
     }
 }
 
-fn reset_targets(fields: &[Field], names: &[String]) -> Option<Vec<String>> {
-    (!names.is_empty())
-        .then(|| fields.iter().map(|f| &f.name).filter(|n| names.iter().any(|x| *n == x || n.starts_with(&format!("{x}.")))).cloned().collect())
-}
-
-/// The opening policy notice shared with frontends; it must remain visible beside a form banner.
+/// The opening policy notice. Frontends translate this exact English string; it is also the
+/// stable entry stored in `DocInfo::warnings`.
 pub const OPEN_SCRIPTS_SKIPPED: &str = "Automatic AcroForm scripts are disabled until safe execution isolation is available; saved field values were preserved. Explicit button and console scripts are still available.";
+
+/// Whether opening would have run document JavaScript, a catalog `/OpenAction` script, or the
+/// opening page's `/AA /O` script. Field scripts alone do not count.
+pub(crate) fn has_deferred_open_scripts(cos: &pdfcraft_cos::Document) -> bool {
+    pdfcraft_forms::document_scripts(cos).iter().any(|s| !s.trim().is_empty()) || !pdfcraft_forms::open_scripts(cos).is_empty()
+}
 
 /// A document-level JavaScript: its name and source.
 pub fn document_scripts(cos: &pdfcraft_cos::Document) -> Vec<(String, String)> {
@@ -316,8 +318,10 @@ impl Session {
         if !changes.is_empty() {
             edits.push(Edit::ApplyScriptChanges { changes });
         }
-        for names in &resets {
-            let names = reset_targets(&fields, names);
+        for names in resets {
+            let all: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+            let names = (!names.is_empty())
+                .then(|| all.iter().filter(|n| names.iter().any(|x| *n == x || n.starts_with(&format!("{x}.")))).cloned().collect());
             edits.push(Edit::ResetForm { names });
         }
         if !edits.is_empty() {

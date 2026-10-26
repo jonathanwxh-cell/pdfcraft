@@ -3789,11 +3789,11 @@ impl Session {
                 }
                 None => (bytes, info, Ok(Ok(cos))),
             },
-            (None, Ok(Ok(cos))) if !context.js_off => {
+            (None, Ok(Ok(cos))) if info.xfa.is_none() && !context.js_off => {
                 // No automatic evaluator is started: cooperative limits and abandoning a
                 // thread cannot bound native operations or memory use. Preserve saved values.
-                // Show the policy for forms without decoding script sources just for a notice.
-                acroform_open_notice = !info.fields.is_empty();
+                // The notice is only for a document that actually has open-time JavaScript.
+                acroform_open_notice = js::has_deferred_open_scripts(&cos);
                 (bytes, info, Ok(Ok(cos)))
             }
             (_, cos) => (bytes, info, cos),

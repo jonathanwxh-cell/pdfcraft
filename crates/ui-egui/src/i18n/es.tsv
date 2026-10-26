@@ -2854,3 +2854,4 @@ theme	Appearance	Aspecto
 
 # Date picker: Today button (#4274) (AI-assisted, not separately native-reviewed)
 	Today	Hoy
+	Automatic AcroForm scripts are disabled until safe execution isolation is available; saved field values were preserved. Explicit button and console scripts are still available.	Los scripts automáticos de AcroForm están desactivados hasta que haya un aislamiento de ejecución seguro; los valores guardados de los campos se conservan. Los scripts de los botones y de la consola siguen disponibles.

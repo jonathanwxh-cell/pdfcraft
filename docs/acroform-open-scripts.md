@@ -7,12 +7,14 @@ open JavaScript. Saved field values and appearances remain unchanged by scripts;
 no script revision or viewer request is produced. Signed and certified AcroForms use
 the same policy.
 
-This deliberately defers #3062's automatic date/field initialization until
-terminating, resource-bounded execution isolation is available. An AcroForm shows
-an explanatory warning alongside its form banner without
-decoding opening-script sources merely to decide whether to show it; the
-notice survives refreshes during the session. Disabling JavaScript globally still
-uses the existing preference behavior.
+This deliberately defers the automatic date and field initialization described in
+issue #2889 until terminating, resource-bounded execution isolation is available.
+The notice is shown only when the file has document JavaScript, an OpenAction
+JavaScript, or an opening-page `/AA /O` JavaScript. Those are read with the
+existing bounded script budget (`document_scripts` and `open_scripts`); a form
+whose only scripts are field actions does not show it. The notice survives
+refreshes during the session. Disabling JavaScript globally still uses the
+existing preference behavior and does not add this notice.
 
 Signed and certified forms show the policy beside their signature-status notice;
 the signature panel action remains available. The notice does not rewrite the PDF.
@@ -46,15 +48,14 @@ from producing OpenDoc requests when the changes are combined. No #2081 remote
 branch or path-consent behavior is changed. The review concern is not presented
 as a demonstrated zero-click exploit.
 
-The retained `pdfcraft_forms::open_scripts` collection helper has no production
-caller under this policy. Its opening-page selection currently handles explicit
-destination arrays only: a named `/GoTo /D` falls back to page zero, for both the
-legacy `/Dests` dictionary and `/Names /Dests` name tree. This verified collection
-limitation must be resolved before that helper is used for automatic execution;
-it does not cause scripts to execute while automatic opening-script execution is
-disabled.
+`pdfcraft_forms::open_scripts` is the presence check for catalog `/OpenAction`
+chains and the opening page's `/AA /O`. A named `/GoTo /D` is resolved through
+`/Names /Dests` and the legacy `/Dests` dictionary before that page is chosen.
+An unresolved name still falls back to page 0. The helper does not run the scripts.
 
-Regression coverage: engine `form_open_scripts_*` tests and UI
-`opening_form_script_policy_notice_is_visible` and
+Regression coverage: engine `form_open_scripts_*` and
+`page_open_script_sets_the_notice_and_field_scripts_do_not`, and UI
+`opening_form_script_policy_notice_is_visible`,
+`form_without_open_scripts_shows_no_policy_notice` and
 `signed_form_shows_signature_and_opening_script_policy`, plus the existing explicit
 button/console tests.

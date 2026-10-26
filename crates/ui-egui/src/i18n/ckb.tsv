@@ -2723,3 +2723,4 @@ certificate	Version	وەشان
 
 # Date picker: Today button (#4274) (AI-assisted, not separately native-reviewed)
 	Today	ئەمڕۆ
+	Automatic AcroForm scripts are disabled until safe execution isolation is available; saved field values were preserved. Explicit button and console scripts are still available.	سکریپتە ئۆتۆماتیکییەکانی AcroForm ناچالاکن تاوەکو دابڕانی جێبەجێکردنی پارێزراو بەردەست بێت؛ نرخی خانە پاشەکەوتکراوەکان وەک خۆیان ماون. سکریپتەکانی دوگمە و کۆنسۆڵ هێشتا بەردەستن.

@@ -49,6 +49,15 @@ fn opening_form_script_policy_notice_is_visible() {
     h.run_steps(4);
     assert_eq!(value(&h, "greeting"), ["saved"]);
     h.get_by_label_contains("Automatic AcroForm scripts are disabled");
+    h.state_mut().set_option("language", "de").unwrap();
+    h.run_steps(2);
+    h.get_by_label_contains("Automatische AcroForm-Skripte sind deaktiviert");
+}
+
+#[test]
+fn form_without_open_scripts_shows_no_policy_notice() {
+    let h = harness();
+    assert!(h.query_by_label_contains("Automatic AcroForm scripts are disabled").is_none());
 }
 
 #[test]

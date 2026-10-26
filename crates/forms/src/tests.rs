@@ -3193,6 +3193,31 @@ fn open_scripts_collect_catalog_next_chains_and_opening_page_actions() {
         "<< /Type /Page /Parent 2 0 R /AA << /O << /S /JavaScript /JS (page2();) >> >> >>".into(),
     ]);
     assert_eq!(open_scripts(&dest_array), ["page2();"]);
+
+    // A named /D, through the name tree and the legacy /Dests dictionary, selects that page.
+    // A dictionary value (`/D`) and a missing name (page 0) are covered too.
+    let named = document(&[
+        "<< /Type /Catalog /Pages 2 0 R /Names << /Dests << /Names [(page2) << /D [4 0 R /Fit] >>] >> >> /OpenAction << /S /GoTo /D (page2) >> >>"
+            .into(),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /AA << /O << /S /JavaScript /JS (page1();) >> >> >>".into(),
+        "<< /Type /Page /Parent 2 0 R /AA << /O << /S /JavaScript /JS (page2();) >> >> >>".into(),
+    ]);
+    assert_eq!(open_scripts(&named), ["page2();"]);
+    let legacy = document(&[
+        "<< /Type /Catalog /Pages 2 0 R /Dests << /page2 [4 0 R /XYZ null null null] >> /OpenAction << /S /GoTo /D /page2 >> >>".into(),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /AA << /O << /S /JavaScript /JS (page1();) >> >> >>".into(),
+        "<< /Type /Page /Parent 2 0 R /AA << /O << /S /JavaScript /JS (page2();) >> >> >>".into(),
+    ]);
+    assert_eq!(open_scripts(&legacy), ["page2();"]);
+    let missing = document(&[
+        "<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /GoTo /D (nowhere) >> >>".into(),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /AA << /O << /S /JavaScript /JS (page1();) >> >> >>".into(),
+        "<< /Type /Page /Parent 2 0 R /AA << /O << /S /JavaScript /JS (page2();) >> >> >>".into(),
+    ]);
+    assert_eq!(open_scripts(&missing), ["page1();"]);
 }
 
 /// Catalog and opening-page actions share the form's stream budget, including repeated streams

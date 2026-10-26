@@ -1908,7 +1908,11 @@ fn run_here(
     };
     ctx.runtime_limits_mut().set_loop_iteration_limit(limits.loop_iterations);
     ctx.runtime_limits_mut().set_recursion_limit(limits.recursion);
-    let _ = install_intrinsic_limits(&mut ctx);
+    // A failed install would leave repeat, pad and join unbounded. Refuse the script instead.
+    if let Err(e) = install_intrinsic_limits(&mut ctx) {
+        let error = Some(format!("the script engine could not start: {e}"));
+        return Outcome { rc: true, value: event.value.clone(), change: event.change.clone(), error, ..Default::default() };
+    }
     ctx.insert_data(RefCell::new(Host {
         fields,
         changed: BTreeSet::new(),

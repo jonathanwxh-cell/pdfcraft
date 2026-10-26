@@ -1866,7 +1866,9 @@ fn check_sandbox_hardening_cases() {
         assert!(o.requests.is_empty() && o.changed.is_empty(), "{script}: {o:?}");
     }
     let o = go("this.resetForm(new Array(9000).fill('x'.repeat(4096)))", &Event::field("Calculate", "total", ""));
+    assert_eq!(o.error, None, "{o:?}");
     assert!(o.requests.is_empty(), "oversized resetForm payload is dropped: {o:?}");
+    assert!(o.console.iter().any(|l| l.contains("left out")), "a dropped reset is recorded: {o:?}");
 
     // AcroForm Outcome vectors (alerts, console, requests) are capped by count and line length.
     let o = go("for (var i = 0; i < 12000; i++) { app.alert('a' + i); console.println('c' + i); this.print(); }", &Event::doc("Open"));
@@ -1874,6 +1876,7 @@ fn check_sandbox_hardening_cases() {
     assert_eq!(o.alerts.len(), xfa::MAX_ALERTS);
     assert!(o.console.len() <= xfa::MAX_CONSOLE + 1);
     assert_eq!(o.requests.len(), xfa::MAX_EFFECTS);
+    assert!(o.console.iter().any(|l| l.contains("left out")), "dropped alerts, console lines and requests are recorded: {o:?}");
 
     let o = go("app.alert('x'.repeat(20000)); console.println('y'.repeat(20000));", &Event::doc("Open"));
     assert_eq!(o.error, None);

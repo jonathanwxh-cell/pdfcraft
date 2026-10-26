@@ -570,8 +570,8 @@ fn content_draws(doc: &Document, content: &[Vec<u8>], xo: &Dict, name: &[u8], de
         if depth >= MAX_DEPTH {
             return None;
         }
-        let Ok(_data) = s.decoded() else { return None };
-        match content_draws(doc, content, xo, name, depth + 1, seen) {
+        let Ok(data) = s.decoded() else { return None };
+        match content_draws(doc, std::slice::from_ref(&data), xo, name, depth + 1, seen) {
             Some(false) => {}
             other => return other,
         }
@@ -1113,40 +1113,15 @@ fn process_from(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                 }
                 let b = bbox.unwrap_or_default();
                 changed = true;
-                if scope.covered(b) {
-                    scope.report.paths_removed += 1;
-                    any_paint_removed = true;
-                    if clips {
-                        // Keep the clipping, drop the painting.
-                        ops.extend(body);
-                        ops.push(Op::new("n", vec![]));
-                    }
-                } else if clips {
-                    // A clip-and-paint path can't be wrapped in q/Q without losing its clip:
-                    // paint it clipped, then set its clip with a no-op path.
-                    record_pattern_paint(&gs, o, &mut painted_patterns);
-                    scope.report.paths_clipped += 1;
-                    if let Some(c) = clip_out(scope.rects, &gs.ctm, b) {
-                        let plain: Vec<Op> = body.iter().filter(|p| !p.is("W") && !p.is("W*")).cloned().collect();
-                        ops.push(Op::new("q", vec![]));
-                        ops.extend(c);
-                        ops.extend(plain);
-                        ops.push(op);
-                        ops.push(Op::new("Q", vec![]));
-                    }
+                scope.report.paths_removed += 1;
+                any_paint_removed = true;
+                if scope.covered(b) && clips {
+                    // Keep the clipping, drop the painting.
                     ops.extend(body);
                     ops.push(Op::new("n", vec![]));
-                } else {
-                    record_pattern_paint(&gs, o, &mut painted_patterns);
-                    scope.report.paths_clipped += 1;
-                    if let Some(c) = clip_out(scope.rects, &gs.ctm, b) {
-                        ops.push(Op::new("q", vec![]));
-                        ops.extend(c);
-                        ops.extend(body);
-                        ops.push(op);
-                        ops.push(Op::new("Q", vec![]));
-                    }
                 }
+                // Partial vector redaction must not retain underlying drawing commands
+                // behind clipping (F-008). Refuse partial clip retention and remove the path.
                 continue;
             }
             if !path.is_empty() {

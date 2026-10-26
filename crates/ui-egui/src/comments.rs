@@ -574,7 +574,8 @@ impl CommentView {
             let ord = ords.entry(a.page).or_default();
             let page_ord = *ord;
             *ord += 1;
-            slots.insert((a.page, a.index), CommentSlot { subtype: a.subtype.clone(), name: a.name.clone(), page_ord, page_count: counts[&a.page] });
+            let page_count = counts.get(&a.page).copied().unwrap_or(0);
+            slots.insert((a.page, a.index), CommentSlot { subtype: a.subtype.clone(), name: a.name.clone(), page_ord, page_count });
         }
         slots
     }
@@ -2826,5 +2827,54 @@ mod tests {
             assert_eq!(view.comments.selected, None);
             assert_eq!(view.pending_edit, None, "index {bad_index} must not emit DeleteAnnotation");
         }
+    }
+
+    /// An unnamed comment has no object name to tell it from the one that slid into its index.
+    /// Deleting the earlier one still drops selection, editing, the composer and a gesture that
+    /// pointed at that index.
+    #[test]
+    fn an_unnamed_shift_clears_state_for_the_old_index() {
+        let annot = |index: usize| Annotation {
+            page: 0,
+            index,
+            subtype: "Text".into(),
+            rect: [10.0, 10.0, 30.0, 30.0],
+            color: None,
+            author: None,
+            contents: None,
+            modified: None,
+            in_reply_to: None,
+            parent: None,
+            grouped: false,
+            name: None,
+            state: None,
+            quads: Vec::new(),
+            locked: false,
+            intent: None,
+            fill_sign: false,
+            no_rotate: false,
+            points: Vec::new(),
+        };
+        let info = DocInfo {
+            pages: vec![
+                PageInfo { width: 300.0, height: 400.0, label: String::new(), crop: [0.0, 0.0, 300.0, 400.0], rotation: 0 },
+                PageInfo { width: 300.0, height: 400.0, label: String::new(), crop: [0.0, 0.0, 300.0, 400.0], rotation: 0 },
+            ],
+            annotations: vec![annot(1), annot(2)],
+            ..Default::default()
+        };
+        let mut view = DocView::new(pdfcraft_engine::DocId(1), &info, crate::canvas::ViewDefaults::default());
+        view.comments.selected = Some((0, 1));
+        view.comments.open_editor(0, 1, "the first note".into());
+        view.comments.composer =
+            Some(Composer { page: 0, at: [10.0, 10.0], kind: ComposerKind::Edit(1), text: "the first note".into(), focus: false });
+        view.comments.gesture = Some(Gesture::Move { page: 0, index: 1, from: pos2(0.0, 0.0) });
+        let mut shifted = info.clone();
+        shifted.annotations = vec![annot(1)];
+        view.document_changed(&shifted);
+        assert_eq!(view.comments.selected, None);
+        assert_eq!(view.comments.editing, None);
+        assert_eq!(view.comments.composer, None);
+        assert_eq!(view.comments.gesture, None);
     }
 }

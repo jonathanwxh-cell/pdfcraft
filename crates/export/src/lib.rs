@@ -840,7 +840,10 @@ fn positioned_page<'a>(page: &'a Page, media: &mut Vec<(String, &'a Image)>, sha
     // page-sized watermark cannot push the invoice footer onto another page.
     let mut s = String::from("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\" w:line=\"20\" w:lineRule=\"exact\"/></w:pPr>");
     let body = body_size(std::slice::from_ref(page)).max(1.0);
-    for b in &page.blocks {
+    // Rotated pages are positioned shapes, so paragraph flow never orders them. Emit the
+    // text boxes in reading order; the file's block order is not the reading order.
+    let blocks = reading_order(page, page.blocks.iter().map(|b| (b.rect, b.size, b)).collect());
+    for b in blocks {
         *shape_id = shape_id.saturating_add(1);
         let rotation = layout_number(-b.rotation).rem_euclid(360.0);
         let (sin, cos) = rotation.to_radians().sin_cos();
@@ -1879,6 +1882,20 @@ mod tests {
         ] {
             let positions: Vec<usize> = expected_lines.iter().map(|s| out.find(s).unwrap_or_else(|| panic!("{s} missing in {fmt}: {out}"))).collect();
             assert!(positions.windows(2).all(|w| w[0] < w[1]), "{fmt} out of order: {positions:?}\n{out}");
+        }
+
+        // The same lines, stored bottom-to-top. Rotated lines do not join one paragraph, and
+        // Word's positioned boxes must follow reading order rather than the file's block order.
+        let mut shuffled = rotated.clone();
+        shuffled.blocks.reverse();
+        for (fmt, out) in [
+            ("html", html(std::slice::from_ref(&shuffled), "Rotated")),
+            ("docx", part(&docx(std::slice::from_ref(&shuffled), "Rotated"), "word/document.xml")),
+            ("rtf", rtf(std::slice::from_ref(&shuffled))),
+            ("pptx", part(&pptx(std::slice::from_ref(&shuffled), "Rotated"), "ppt/slides/slide1.xml")),
+        ] {
+            let positions: Vec<usize> = expected_lines.iter().map(|s| out.find(s).unwrap_or_else(|| panic!("{s} missing in {fmt}: {out}"))).collect();
+            assert!(positions.windows(2).all(|w| w[0] < w[1]), "{fmt} shuffled out of order: {positions:?}\n{out}");
         }
     }
 

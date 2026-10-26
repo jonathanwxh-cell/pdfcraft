@@ -1135,6 +1135,65 @@ fn xfa_page_swap(doc: &mut Document) {
     .unwrap();
 }
 
+/// A second widget that reuses the signed field's name and `/V` is not that signature.
+#[test]
+fn a_later_field_with_the_same_name_does_not_inherit_the_signature() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let signed = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { field: Some("Approval".into()), ..opts() }).unwrap();
+    let edited = edit_after(&signed, |doc| {
+        let root = doc.root().unwrap();
+        let form = doc.get(root).as_dict().and_then(|c| c.get(b"AcroForm")).map(|a| doc.resolve(a)).and_then(|a| a.as_dict().cloned()).unwrap();
+        let fields = form.get(b"Fields").map(|f| doc.resolve(f)).and_then(|f| f.as_array().cloned()).unwrap();
+        let original = fields.iter().find_map(Object::as_ref).unwrap();
+        let value = doc.get(original).as_dict().unwrap().get(b"V").cloned().expect("the signed field has /V");
+        let mut widget = pdfcraft_cos::Dict::new();
+        widget.set(b"Type".to_vec(), Object::name("Annot"));
+        widget.set(b"Subtype".to_vec(), Object::name("Widget"));
+        widget.set(b"FT".to_vec(), Object::name("Sig"));
+        widget.set(b"T".to_vec(), PdfString::text("Approval"));
+        widget.set(b"Rect".to_vec(), Object::Array(vec![Object::Int(10), Object::Int(10), Object::Int(80), Object::Int(40)]));
+        widget.set(b"P".to_vec(), Object::Ref(pdfcraft_cos::ObjRef { num: 3, generation: 0 }));
+        widget.set(b"V".to_vec(), value);
+        let planted = doc.add(Object::Dict(widget));
+        doc.update_dict(root, |c| {
+            if let Some(Object::Dict(form)) = c.get_mut(b"AcroForm")
+                && let Some(Object::Array(list)) = form.get_mut(b"Fields")
+            {
+                list.push(Object::Ref(planted));
+            }
+        })
+        .unwrap();
+        doc.update_dict(pdfcraft_cos::ObjRef { num: 3, generation: 0 }, |p| {
+            if let Some(Object::Array(annots)) = p.get_mut(b"Annots") {
+                annots.push(Object::Ref(planted));
+            }
+        })
+        .unwrap();
+    });
+    let listed = signatures(&open(&edited), &edited, &trust);
+    let original = listed.iter().find(|s| s.rect == Some([150.0, 20.0, 280.0, 70.0])).expect("original field");
+    let planted = listed.iter().find(|s| s.rect == Some([10.0, 10.0, 80.0, 40.0])).expect("planted field");
+    assert_eq!(original.status, Status::Valid, "{:?}", original.details);
+    assert_ne!(planted.status, Status::Valid, "the planted widget inherited the signature: {:?}", planted.details);
+}
+
+#[test]
+fn toggling_needs_rendering_is_a_structure_change() {
+    let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
+    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let check = |bytes: &[u8]| signatures(&open(bytes), bytes, &trust).into_iter().find(|s| s.signed).unwrap();
+    let certified = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { certify: Some(1), ..opts() }).unwrap();
+    assert_eq!(check(&certified).status, Status::Valid);
+    let edited = edit_after(&certified, |doc| {
+        let root = doc.root().unwrap();
+        doc.update_dict(root, |c| c.set(b"NeedsRendering".to_vec(), Object::Bool(true))).unwrap();
+    });
+    let s = check(&edited);
+    assert_eq!(s.status, Status::Invalid, "{:?}", s.details);
+    assert!(matches!(&s.modification, Modification::Disallowed(k) if k.contains(&kind::STRUCTURE)), "{:?}", s.modification);
+}
+
 #[test]
 fn declaring_a_form_xfa_does_not_excuse_replacing_the_pages() {
     let id = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();

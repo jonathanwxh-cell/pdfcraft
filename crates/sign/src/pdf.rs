@@ -725,8 +725,18 @@ fn dict_contents(doc: &Document, d: &Dict) -> Option<Vec<u8>> {
 
 fn find_sig_in_revision(rev: &Document, field: Option<&Field>, stamp_ref: Option<ObjRef>) -> Option<Dict> {
     if let Some(f) = field {
-        let matched = sig_fields(rev).into_iter().find(|of| (f.r.is_some() && of.r == f.r) || of.name == f.name)?;
-        matched.signature(rev)
+        // A later field that reuses the name is a different field. Match the object when we
+        // have one, and the name only when neither side has an object. Two candidates is not
+        // a match: the signature must not be reported on an attacker-chosen widget.
+        let mut matched = sig_fields(rev).into_iter().filter(|of| match f.r {
+            Some(want) => of.r == Some(want),
+            None => of.r.is_none() && of.name == f.name,
+        });
+        let found = matched.next()?;
+        if matched.next().is_some() {
+            return None;
+        }
+        found.signature(rev)
     } else if let Some(r) = stamp_ref {
         rev.try_get(r.num).ok().and_then(|o| o.as_dict().cloned()).filter(is_doc_timestamp)
     } else {
@@ -2007,7 +2017,8 @@ fn signed_page_resources(old: &Document, pages: &HashSet<ObjRef>) -> HashMap<Obj
 /// A changed object that was the catalog in the signed revision, judged by its role as the
 /// catalog whatever `/Type` its new version carries.
 fn catalog_change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> &'static str {
-    let keys: &[&[u8]] = &[b"AcroForm", b"DSS", b"Perms", b"Metadata", b"NeedsRendering", b"Extensions"];
+    // /NeedsRendering selects dynamic XFA rendering. A change of it is structure, not metadata.
+    let keys: &[&[u8]] = &[b"AcroForm", b"DSS", b"Perms", b"Metadata", b"Extensions"];
     match before {
         Some(b) if without(d, keys) != without(b, keys) => kind::STRUCTURE,
         // Developer extensions (ISO 32000-2 §7.12) only declare what the file uses. A

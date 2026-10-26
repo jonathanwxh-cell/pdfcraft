@@ -532,9 +532,17 @@ pub struct CommentView {
     pub tool_done: bool,
     /// What the inline editor (`editing`) does with the keyboard the next time it is drawn.
     pub(crate) editor_focus: Option<EditorFocus>,
-    /// Snapshot of `(page, index, subtype, name)` slots from the last `DocInfo`, used to detect
+    /// Snapshot of `(page, index)` comment slot identity from the last `DocInfo`, used to detect
     /// when an edit removes or shifts `/Annots` entries under an active selection or editor.
-    slots: Vec<(usize, usize, String, Option<String>)>,
+    slots: std::collections::HashMap<(usize, usize), CommentSlot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommentSlot {
+    subtype: String,
+    name: Option<String>,
+    page_ord: usize,
+    page_count: usize,
 }
 
 /// A one-off change to the keyboard focus of the Comments panel's inline editor. The editor
@@ -554,9 +562,21 @@ impl CommentView {
         Self { slots: Self::snapshot_slots(info), ..Default::default() }
     }
 
-    /// Captures `(page, index, subtype, name)` for every comment in `info`.
-    fn snapshot_slots(info: &DocInfo) -> Vec<(usize, usize, String, Option<String>)> {
-        info.annotations.iter().map(|a| (a.page, a.index, a.subtype.clone(), a.name.clone())).collect()
+    /// Captures `(page, index)` comment slot identity for every comment in `info`.
+    fn snapshot_slots(info: &DocInfo) -> std::collections::HashMap<(usize, usize), CommentSlot> {
+        let mut counts = std::collections::HashMap::<usize, usize>::new();
+        for a in &info.annotations {
+            *counts.entry(a.page).or_default() += 1;
+        }
+        let mut ords = std::collections::HashMap::<usize, usize>::new();
+        let mut slots = std::collections::HashMap::with_capacity(info.annotations.len());
+        for a in &info.annotations {
+            let ord = ords.entry(a.page).or_default();
+            let page_ord = *ord;
+            *ord += 1;
+            slots.insert((a.page, a.index), CommentSlot { subtype: a.subtype.clone(), name: a.name.clone(), page_ord, page_count: counts[&a.page] });
+        }
+        slots
     }
 
     /// Prunes comment state whose `(page, index)` slot was removed or shifted by a document change.
@@ -564,21 +584,15 @@ impl CommentView {
         let next = Self::snapshot_slots(info);
         let page_count = info.pages.len();
         let same_slot = |page: usize, index: usize| -> bool {
-            let Some((_, _, sub, nm)) = next.iter().find(|(p, i, _, _)| *p == page && *i == index) else {
+            let Some(cur) = next.get(&(page, index)) else {
                 return false;
             };
             if self.slots.is_empty() {
                 return true;
             }
-            let new_on_page = next.iter().filter(|(p, _, _, _)| *p == page).count();
-            let old_on_page = self.slots.iter().filter(|(p, _, _, _)| *p == page).count();
-            new_on_page >= old_on_page
-                && self.slots.iter().any(|(p, i, s, n)| *p == page && *i == index && s == sub && n == nm)
-                && self
-                    .slots
-                    .iter()
-                    .filter(|(p, i, _, _)| *p == page && *i <= index)
-                    .all(|(p, i, s, n)| next.iter().any(|(np, ni, ns, nn)| np == p && ni == i && ns == s && nn == n))
+            self.slots.get(&(page, index)).is_some_and(|old| {
+                cur.subtype == old.subtype && cur.name == old.name && cur.page_ord == old.page_ord && cur.page_count >= old.page_count
+            })
         };
         if self.selected.is_some_and(|(p, i)| !same_slot(p, i)) {
             self.selected = None;
@@ -593,7 +607,14 @@ impl CommentView {
         }) {
             self.composer = None;
         }
-        self.gesture = None;
+        if self.gesture.as_ref().is_some_and(|g| match g {
+            Gesture::Draw { page, .. } => *page >= page_count,
+            Gesture::Move { page, index, .. } | Gesture::Resize { page, index, .. } | Gesture::Reshape { page, index, .. } => {
+                !same_slot(*page, *index)
+            }
+        }) {
+            self.gesture = None;
+        }
         self.slots = next;
     }
 
@@ -1672,12 +1693,12 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
         anchor = anchor.clamp(viewport.min, viewport.max);
     }
     let pos = pos2(anchor.x + 12.0, anchor.y);
-    let area = egui::Area::new(egui::Id::new(("comment-composer", view.id.0))).order(egui::Order::Foreground).constrain_to(viewport);
+    let area = egui::Area::new(egui::Id::unique(("comment-composer", view.id.0))).order(egui::Order::Foreground).constrain_to(viewport);
     area.fixed_pos(pos).show(ctx, |ui| {
         egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(12)).corner_radius(CornerRadius::same(8)).show(ui, |ui| {
             ui.set_width(260.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(crate::bidi::visual_auto(&prefs.author)).font(theme::semibold(13.0)));
+                ui.label(egui::RichText::new(prefs.author.clone()).font(theme::semibold(13.0)));
                 ui.label(egui::RichText::new(tl!(title)).font(theme::regular(11.5)).color(t.text_faint));
             });
             ui.add_space(6.0);
@@ -1687,8 +1708,10 @@ pub(crate) fn composer(ctx: &egui::Context, view: &mut DocView, info: &DocInfo, 
                 ComposerKind::Replace => tl!("Replacement text"),
                 _ => tl!("Add a comment"),
             };
-            let edit =
-                ui.add(egui::TextEdit::multiline(&mut c.text).hint_text(hint).desired_rows(3).desired_width(f32::INFINITY).id_salt("composer-text"));
+            let edit = ui
+                .add(egui::TextEdit::multiline(&mut c.text).hint_text(hint).desired_rows(3).desired_width(f32::INFINITY).id_salt("composer-text"))
+                // 0.37 kittest rejects an unnamed text input; the hint is its logical name.
+                .accessible_name(hint);
             if c.focus {
                 edit.request_focus();
                 c.focus = false;
@@ -2111,8 +2134,9 @@ pub enum CanvasAction {
 /// How many custom colours the "Recent colours" row keeps.
 const RECENT_CUSTOM: usize = 5;
 
+/// Return the stable egui id for the recent custom-colour palette.
 fn recent_custom_id() -> egui::Id {
-    egui::Id::new("pdfcraft-recent-custom-colours")
+    egui::Id::unique("pdfcraft-recent-custom-colours")
 }
 
 /// Custom colours picked with "Other colour…" this session, newest first (#1193).
@@ -2146,7 +2170,7 @@ fn rgb_of(c: Color32) -> Rgb {
 /// One round swatch; `on` rings it as the current colour.
 fn swatch(ui: &mut egui::Ui, c: Rgb, on: bool, tooltip: &str) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tooltip));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tooltip));
     ui.painter().circle_filled(r.center(), 9.0, color32(c));
     ui.painter().circle_stroke(r.center(), 9.0, Stroke::new(1.0, Color32::from_black_alpha(40)));
     if on || resp.hovered() {
@@ -2168,7 +2192,7 @@ fn other_colour_swatch(ui: &mut egui::Ui, open: bool) -> egui::Response {
         ui.painter().circle_stroke(c, 11.0, Stroke::new(1.5, SELECT_BLUE));
     }
     let label = tl!("Other colour…");
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, open, label));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, open, label));
     resp.on_hover_text(label)
 }
 
@@ -2257,7 +2281,7 @@ pub(crate) fn quick_bar_controls(ui: &mut egui::Ui, tool: CommentTool, prefs: &m
     let (r, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
     ui.painter().circle_filled(r.center(), 9.0, color32(style.color));
     ui.painter().circle_stroke(r.center(), 9.0, Stroke::new(1.0, Color32::from_black_alpha(50)));
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tl!("Colour")));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!("Colour")));
     let resp = resp.on_hover_text(tl!("Colour"));
     egui::Popup::menu(&resp).align(egui::RectAlign::RIGHT_START).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
         if let Some(c) = swatch_grid(ui, Some(style.color)) {
@@ -2321,7 +2345,7 @@ fn fill_button(ui: &mut egui::Ui, fill: Option<Rgb>) -> egui::Response {
         Some(_) => tl!("Fill colour"),
         None => tl!("Fill colour: none"),
     };
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     resp.on_hover_text(label)
 }
 
@@ -2642,7 +2666,7 @@ mod tests {
         h.run();
         h.get_by_label("Page").click_secondary();
         h.run();
-        h.get_by_label("Colour ⏵").click();
+        h.get_by_label("Colour").click();
         h.run();
         h.get_by_label("Other colour…").click();
         h.run();
@@ -2760,14 +2784,14 @@ mod tests {
         view.comments.composer = Some(Composer { page: 0, at: [10.0, 10.0], kind: ComposerKind::Edit(2), text: "body".into(), focus: false });
         view.comments.gesture = Some(Gesture::Move { page: 0, index: 2, from: pos2(0.0, 0.0) });
 
-        // Moving/editing in place or appending a comment at index 3 preserves (0, 2) selection/editing.
+        // Moving/editing in place or appending a comment at index 3 preserves (0, 2) selection/editing/gesture.
         let mut appended = info.clone();
         appended.annotations.push(annot(3, "c3"));
         view.document_changed(&appended);
         assert_eq!(view.comments.selected, Some((0, 2)));
         assert!(view.comments.editing.is_some());
         assert!(view.comments.composer.is_some());
-        assert!(view.comments.gesture.is_none());
+        assert!(view.comments.gesture.is_some());
 
         // Deleting comment 1 shifts comment 2 down to index 1: stale state at (0, 2) and shifted (0, 1) must clear.
         let mut shifted = info.clone();
@@ -2775,10 +2799,12 @@ mod tests {
         view.comments.selected = Some((0, 1));
         view.comments.open_editor(0, 1, "for c1, not c2".into());
         view.comments.composer = Some(Composer { page: 0, at: [10.0, 10.0], kind: ComposerKind::Edit(1), text: "for c1".into(), focus: false });
+        view.comments.gesture = Some(Gesture::Move { page: 0, index: 1, from: pos2(0.0, 0.0) });
         view.document_changed(&shifted);
         assert_eq!(view.comments.selected, None);
         assert_eq!(view.comments.editing, None);
         assert_eq!(view.comments.composer, None);
+        assert_eq!(view.comments.gesture, None);
 
         // Pressing Delete when `selected` holds a widget index (0, 0) or stale index (0, 2) emits no edit.
         let ctx = egui::Context::default();

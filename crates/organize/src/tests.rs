@@ -2110,6 +2110,49 @@ fn extracting_splitting_and_combining_preserve_page_labels() {
     assert!(err.contains("the number tree has too many entries"), "{err}");
 }
 
+/// A range the reader accepts but the writer cannot store (a Roman numeral past 1,024 bytes, or a
+/// decimal span whose labels grow past that) degrades to the source physical numbers. Extract
+/// still succeeds, and a neighbouring range that does fit is kept.
+#[test]
+fn extracting_unrepresentable_labels_uses_physical_numbers() {
+    let mut roman = doc_a();
+    let mut spec = Dict::new();
+    spec.set(b"S".to_vec(), Object::name("R"));
+    spec.set(b"St".to_vec(), Object::Int(4_000_000));
+    let mut tree = Dict::new();
+    tree.set(b"Nums".to_vec(), Object::Array(vec![Object::Int(0), Object::Dict(spec)]));
+    let tree = roman.add(Object::Dict(tree));
+    roman.update_dict(roman.root().unwrap(), |c| c.set(b"PageLabels".to_vec(), Object::Ref(tree))).unwrap();
+    let extracted = full_roundtrip(&extract_pages(&roman, &[0, 2]).unwrap());
+    assert_eq!(crate::page_labels(&extracted).unwrap(), ["1", "3"]);
+
+    let mut wide = flat_doc(5);
+    let mut spec = Dict::new();
+    spec.set(b"P".to_vec(), Object::String(PdfString::text(&"p".repeat(1_020))));
+    spec.set(b"S".to_vec(), Object::name("D"));
+    spec.set(b"St".to_vec(), Object::Int(9_996));
+    let mut tree = Dict::new();
+    tree.set(b"Nums".to_vec(), Object::Array(vec![Object::Int(0), Object::Dict(spec)]));
+    let tree = wide.add(Object::Dict(tree));
+    wide.update_dict(wide.root().unwrap(), |c| c.set(b"PageLabels".to_vec(), Object::Ref(tree))).unwrap();
+    let extracted = full_roundtrip(&extract_pages(&wide, &[0, 1, 2, 3, 4]).unwrap());
+    assert_eq!(crate::page_labels(&extracted).unwrap(), ["1", "2", "3", "4", "5"]);
+
+    let mut mixed = doc_a();
+    let mut ok = Dict::new();
+    ok.set(b"P".to_vec(), Object::String(PdfString::text("ok-")));
+    ok.set(b"S".to_vec(), Object::name("D"));
+    let mut huge = Dict::new();
+    huge.set(b"S".to_vec(), Object::name("R"));
+    huge.set(b"St".to_vec(), Object::Int(4_000_000));
+    let mut tree = Dict::new();
+    tree.set(b"Nums".to_vec(), Object::Array(vec![Object::Int(0), Object::Dict(ok), Object::Int(1), Object::Dict(huge)]));
+    let tree = mixed.add(Object::Dict(tree));
+    mixed.update_dict(mixed.root().unwrap(), |c| c.set(b"PageLabels".to_vec(), Object::Ref(tree))).unwrap();
+    let extracted = full_roundtrip(&extract_pages(&mixed, &[0, 1]).unwrap());
+    assert_eq!(crate::page_labels(&extracted).unwrap(), ["ok-1", "2"]);
+}
+
 #[test]
 fn page_label_limits_reject_unsupported_edits_before_mutating() {
     use crate::LabelStyle::*;

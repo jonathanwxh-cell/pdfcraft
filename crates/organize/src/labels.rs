@@ -482,6 +482,17 @@ fn push_merged_range(merged: &mut Vec<LabelRange>, prefix_left: &mut usize, r: L
     Ok(())
 }
 
+/// Decimal numbering that shows the source page's physical number (`src_page` is 0-based).
+fn source_physical_range(dst_start: usize, src_page: usize) -> LabelRange {
+    LabelRange { start: dst_start, style: LabelStyle::Decimal, prefix: String::new(), first: u32::try_from(src_page.saturating_add(1)).unwrap_or(1) }
+}
+
+/// Whether `set_page_label_ranges` can store `r` while it covers `r.start..end` (`end` exclusive).
+/// Entry-count and aggregate-prefix limits stay hard errors in [`push_merged_range`].
+fn range_writable(r: &LabelRange, end: usize) -> bool {
+    r.label(r.start).is_ok() && check_spans(std::slice::from_ref(r), end).is_ok()
+}
+
 /// Append the label ranges that `pages` (0-based indices in `src`) carry when placed at
 /// `dst_start` in an output document. Sets `has_labels` when `src` has `/PageLabels`.
 pub(crate) fn collect_page_labels(
@@ -517,29 +528,38 @@ pub(crate) fn collect_page_labels(
             len += 1;
         }
         let run_dst = dst_start + i;
+        let src_end = src_start.saturating_add(len);
+        let run_end = run_dst.saturating_add(len);
         let idx = src_ranges.partition_point(|r| r.start <= src_start).saturating_sub(1);
+        let span_end = |following: Option<usize>| {
+            following
+                .filter(|start| *start > src_start && *start < src_end)
+                .and_then(|start| start.checked_sub(src_start).and_then(|delta| run_dst.checked_add(delta)))
+                .unwrap_or(run_end)
+        };
         if let Some(first_range) = src_ranges.get(idx) {
             let mapped = match first_range.number(src_start) {
                 Ok(first) => LabelRange { start: run_dst, style: first_range.style, prefix: first_range.prefix.clone(), first },
-                Err(_) => LabelRange {
-                    start: run_dst,
-                    style: LabelStyle::Decimal,
-                    prefix: String::new(),
-                    first: u32::try_from(run_dst.saturating_add(1)).unwrap_or(1),
-                },
+                Err(_) => source_physical_range(run_dst, src_start),
+            };
+            let mapped = if range_writable(&mapped, span_end(src_ranges.get(idx + 1).map(|r| r.start))) {
+                mapped
+            } else {
+                source_physical_range(run_dst, src_start)
             };
             push_merged_range(out, &mut prefix_left, mapped)?;
         }
-        let src_end = src_start.saturating_add(len);
-        for r in src_ranges.get(idx + 1..).unwrap_or_default() {
+        let tail = src_ranges.get(idx + 1..).unwrap_or_default();
+        for (n, r) in tail.iter().enumerate() {
             if r.start >= src_end {
                 break;
             }
-            push_merged_range(
-                out,
-                &mut prefix_left,
-                LabelRange { start: run_dst + (r.start - src_start), style: r.style, prefix: r.prefix.clone(), first: r.first },
-            )?;
+            let Some(delta) = r.start.checked_sub(src_start) else { continue };
+            let Some(start) = run_dst.checked_add(delta) else { continue };
+            let inner = LabelRange { start, style: r.style, prefix: r.prefix.clone(), first: r.first };
+            let following = tail.get(n + 1).map(|next| next.start);
+            let inner = if range_writable(&inner, span_end(following)) { inner } else { source_physical_range(start, r.start) };
+            push_merged_range(out, &mut prefix_left, inner)?;
         }
         i += len;
     }

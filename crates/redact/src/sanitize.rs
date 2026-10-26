@@ -416,7 +416,7 @@ fn content_pass(doc: &mut Document, text: bool, layers: bool, write: bool) -> Re
             if out.has_resource_changes() {
                 // A full save keeps whatever is still referenced: unlink the originals this page no
                 // longer draws so the removed form or image bytes cannot survive in the saved file.
-                out.apply_resources(doc, &mut res, &page_content);
+                out.apply_resources(doc, &mut res, &page_content)?;
             }
             retired_properties.extend(crate::interp::prune_properties(doc, &mut res, &page_content)?);
             doc.update_dict(page.obj, |d| {

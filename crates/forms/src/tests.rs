@@ -3438,6 +3438,33 @@ fn deleting_a_field_does_not_prune_an_unrelated_terminal_named_as_parent() {
     assert_eq!(fields(&saved).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["public"]);
 }
 
+/// The inverse of the test above: `public` is not `secret`'s parent in `/Kids`, so deleting
+/// `public` must keep `secret` and drop the dangling `/Parent`. The popup whose `/Parent` is
+/// `public` is a real child of that annotation and still goes.
+#[test]
+fn deleting_a_field_does_not_prune_a_terminal_that_only_names_it_as_parent() {
+    let mut doc = document(&[
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 600 800] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /Annots [5 0 R 6 0 R 7 0 R] >>".into(),
+        "<< /Fields [5 0 R 6 0 R] >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (secret) /Parent 6 0 R /V (SECRET_VALUE) /Rect [0 0 10 10] >>".into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (public) /V (PUBLIC_SECRET) /AA << /C << /S /JavaScript /JS (PUBLIC_ACTION) >> >> /Rect [20 0 30 10] /Popup 7 0 R >>".into(),
+        "<< /Type /Annot /Subtype /Popup /Parent 6 0 R /Rect [40 0 80 40] /Contents (PUBLIC_POPUP) >>".into(),
+    ]);
+    delete_field(&mut doc, "public").unwrap();
+    let bytes = pdfcraft_cos::write_full(&doc, &SaveOptions { object_streams: false, ..SaveOptions::default() }).unwrap();
+    let saved = Document::open(Arc::new(bytes.clone())).unwrap();
+    let names: Vec<_> = fields(&saved).iter().map(|f| f.name.clone()).collect();
+    assert_eq!(names, ["secret"]);
+    let secret_obj = fields(&saved)[0].obj;
+    let secret = saved.get(secret_obj).as_dict().cloned().unwrap();
+    assert!(secret.get(b"Parent").is_none(), "dangling /Parent still reaches the deleted field");
+    assert_eq!(secret.get(b"V").and_then(|v| v.as_string()).map(|s| s.bytes.as_slice()), Some(&b"SECRET_VALUE"[..]));
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(!text.contains("PUBLIC_SECRET") && !text.contains("PUBLIC_ACTION") && !text.contains("PUBLIC_POPUP"), "{text}");
+}
+
 #[test]
 fn deleted_field_tags_prune_ancestors_id_tree_bounds_and_shared_arrays() {
     for kind in ["nested", "direct", "shared", "cycle", "indirect_id_kids", "indirect_limits"] {
@@ -3513,6 +3540,9 @@ fn deleting_field_rejects_cyclic_direct_name_tree_children_with_a_bound() {
         "[<< /Kids 7 0 R >>]".into(),
     ]);
     assert!(matches!(delete_field(&mut doc, "secret"), Err(FormError::Invalid(_))));
+    assert_eq!(fields(&doc).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["secret"]);
+    let bytes = pdfcraft_cos::write_full(&doc, &SaveOptions { object_streams: false, ..SaveOptions::default() }).unwrap();
+    assert!(bytes.windows(b"SECRET_VALUE".len()).any(|w| w == b"SECRET_VALUE"), "a refused deletion must not drop the field");
 }
 
 /// A Calculate script naming thousands of fields is merged with the field's other reads in one

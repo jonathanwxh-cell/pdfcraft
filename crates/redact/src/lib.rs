@@ -484,7 +484,7 @@ fn apply_to(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Redac
                         _ => Vec::new(),
                     })
                     .collect();
-                out.apply_resources(doc, &mut res, &page_content);
+                out.apply_resources(doc, &mut res, &page_content)?;
             }
             let (_, cleaned_data) = page_streams(
                 doc,

@@ -1580,6 +1580,16 @@ pub fn delete_field_object(doc: &mut Document, obj: ObjRef) -> Result<(), FormEr
 }
 
 fn delete_found_field(doc: &mut Document, f: Field) -> Result<(), FormError> {
+    // Structure cleanup can fail after the field is already unlinked. Restore on that error.
+    let snapshot = doc.clone();
+    if let Err(error) = delete_found_field_in(doc, f) {
+        *doc = snapshot;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn delete_found_field_in(doc: &mut Document, f: Field) -> Result<(), FormError> {
     let mut removed: std::collections::HashSet<ObjRef> = f.widgets.iter().map(|w| w.obj).collect();
     removed.insert(f.obj);
 
@@ -1632,8 +1642,9 @@ fn delete_found_field(doc: &mut Document, f: Field) -> Result<(), FormError> {
                 if removed.contains(&r) {
                     continue;
                 }
+                // Only a popup is removed through /Parent. A dangling /Parent on anything else is cleared below.
                 if let Some(d) = doc.get(r).as_dict()
-                    && (d.reference(b"Parent").is_some_and(|pr| removed.contains(&pr))
+                    && ((d.name(b"Subtype") == Some(b"Popup") && d.reference(b"Parent").is_some_and(|pr| removed.contains(&pr)))
                         || d.reference(b"IRT").is_some_and(|irt| removed.contains(&irt)))
                 {
                     removed.insert(r);
@@ -1643,6 +1654,25 @@ fn delete_found_field(doc: &mut Document, f: Field) -> Result<(), FormError> {
         if removed.len() == before {
             break;
         }
+    }
+
+    let mut dangling_parents = Vec::new();
+    for &p in &pages {
+        let Some(a) = doc.get(p).as_dict().and_then(|d| d.get(b"Annots").cloned()) else { continue };
+        for item in doc.resolve(&a).as_array().into_iter().flatten() {
+            let Some(r) = item.as_ref() else { continue };
+            if removed.contains(&r) {
+                continue;
+            }
+            if doc.get(r).as_dict().and_then(|d| d.reference(b"Parent")).is_some_and(|pr| removed.contains(&pr)) {
+                dangling_parents.push(r);
+            }
+        }
+    }
+    for r in dangling_parents {
+        doc.update_dict(r, |d| {
+            d.remove(b"Parent");
+        })?;
     }
 
     for p in pages {

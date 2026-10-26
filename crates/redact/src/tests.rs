@@ -2950,6 +2950,50 @@ fn retained_forms_and_stencils_keep_their_selected_patterns() {
     }
 }
 
+/// A form with no `/Resources` draws the page's `/ExtGState` and `/Pattern` names. Redacting
+/// the page must not drop those names, or the form's public text and pattern disappear.
+#[test]
+fn inheriting_forms_keep_extgstate_fonts_and_patterns() {
+    let font = FONT.replace("95 0 R", "6 0 R").replace("/Arial", "/PublicFace").into_bytes();
+    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300]", b"BT /GS1 gs 10 100 Td (PUBLIC) Tj ET");
+    let mut doc = one_page(
+        b"/GS1 gs BT 10 200 Td (SECRET) Tj ET /Fm Do",
+        "/ExtGState << /GS1 7 0 R >> /XObject << /Fm 9 0 R >>",
+        vec![b"<< /Type /ExtGState /Font [8 0 R 10] >>".to_vec(), font, form],
+    );
+    mark(&mut doc, 0, &[[8.0, 195.0, 45.0, 215.0]], "");
+    apply(&mut doc, None).unwrap();
+    let saved = Document::open(Arc::new(write_full(&doc, &SaveOptions { object_streams: false, ..SaveOptions::default() }).unwrap())).unwrap();
+    assert!(!content(&saved, 0).contains("SECRET"));
+    let page = pdfcraft_model::pages(&saved).remove(0);
+    let resources = saved.resolve(page.dict.get(b"Resources").unwrap());
+    let states = saved.resolve(resources.as_dict().unwrap().get(b"ExtGState").expect("ExtGState dropped"));
+    assert!(states.as_dict().unwrap().contains(b"GS1"), "inheriting form still selects /GS1");
+    let mut saved = saved;
+    assert_eq!(under(&mut saved, 0, &[[5.0, 95.0, 50.0, 115.0]]), 6, "PUBLIC must still use the ExtGState font");
+
+    let pattern = stream(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 300 300] /XStep 300 /YStep 300 /Resources << /Font << /F1 5 0 R >> >>",
+        b"BT /F1 10 Tf 10 10 Td (PATTERN_PUBLIC) Tj ET",
+    );
+    let form = stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300]", b"/Pattern cs /Pat scn 0 0 80 40 re f");
+    let mut doc = one_page(
+        b"/Pattern cs /Pat scn BT /F1 10 Tf 10 200 Td (SECRET) Tj ET /Fm Do",
+        "/Pattern << /Pat 7 0 R >> /XObject << /Fm 8 0 R >>",
+        vec![pattern, form],
+    );
+    mark(&mut doc, 0, &[[8.0, 195.0, 45.0, 215.0]], "");
+    apply(&mut doc, None).unwrap();
+    let bytes = write_full(&doc, &SaveOptions { object_streams: false, ..SaveOptions::default() }).unwrap();
+    assert!(!bytes.windows(b"SECRET".len()).any(|w| w == b"SECRET"));
+    assert!(bytes.windows(b"PATTERN_PUBLIC".len()).any(|w| w == b"PATTERN_PUBLIC"), "pattern used only by an inheriting form was dropped");
+    let saved = Document::open(Arc::new(bytes)).unwrap();
+    let page = pdfcraft_model::pages(&saved).remove(0);
+    let resources = saved.resolve(page.dict.get(b"Resources").unwrap());
+    let patterns = saved.resolve(resources.as_dict().unwrap().get(b"Pattern").expect("Pattern dropped"));
+    assert!(patterns.as_dict().unwrap().contains(b"Pat"));
+}
+
 #[test]
 fn form_entries_share_one_budget_per_page() {
     // 20 draws of a form that draws the next 20 times, four levels down: 160,000 glyphs from a

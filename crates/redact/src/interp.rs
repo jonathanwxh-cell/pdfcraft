@@ -120,7 +120,12 @@ impl Output {
             || !self.replaced_ext_gstates.is_empty()
     }
 
-    pub fn apply_resources(&self, doc: &Document, res: &mut Dict, content: &[Vec<u8>]) {
+    pub fn apply_resources(&self, doc: &Document, res: &mut Dict, content: &[Vec<u8>]) -> Result<(), CosError> {
+        // A form with no /Resources of its own draws these names through this dictionary.
+        // Read that use before any entry is removed; an unreadable form keeps the names by
+        // failing the redaction rather than dropping a font or pattern it still paints.
+        let inherited =
+            if self.replaced_patterns.is_empty() && self.replaced_ext_gstates.is_empty() { None } else { Some(resource_ops(doc, res, content)?) };
         if !self.xobjects.is_empty() || !self.replaced.is_empty() {
             let mut xo = res_dict(doc, res, b"XObject");
             prune(&mut xo, &self.replaced, content);
@@ -131,7 +136,9 @@ impl Output {
         }
         if !self.patterns.is_empty() || !self.replaced_patterns.is_empty() {
             let mut pat = res_dict(doc, res, b"Pattern");
-            prune_patterns(&mut pat, &self.replaced_patterns, content);
+            if let Some(ops) = &inherited {
+                prune_patterns(&mut pat, &self.replaced_patterns, ops);
+            }
             for (n, r) in &self.patterns {
                 pat.set(n.clone(), Object::Ref(*r));
             }
@@ -143,7 +150,9 @@ impl Output {
         }
         if !self.ext_gstates.is_empty() || !self.replaced_ext_gstates.is_empty() {
             let mut egs = res_dict(doc, res, b"ExtGState");
-            prune_extgstates(&mut egs, &self.replaced_ext_gstates, content);
+            if let Some(ops) = &inherited {
+                prune_extgstates(&mut egs, &self.replaced_ext_gstates, ops);
+            }
             for (n, r) in &self.ext_gstates {
                 egs.set(n.clone(), Object::Ref(*r));
             }
@@ -153,6 +162,7 @@ impl Output {
                 res.set(b"ExtGState".to_vec(), Object::Dict(egs));
             }
         }
+        Ok(())
     }
 }
 
@@ -497,12 +507,10 @@ pub(crate) fn prune(xo: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>]) {
     }
 }
 
-pub(crate) fn prune_patterns(pat: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>]) {
+pub(crate) fn prune_patterns(pat: &mut Dict, replaced: &[Vec<u8>], ops: &[Op]) {
     if replaced.is_empty() {
         return;
     }
-    let joined = Pieces::join(content);
-    let ops = joined.parse().ops;
     let still_used =
         |n: &[u8]| ops.iter().any(|op| matches!(op.op.as_slice(), b"scn" | b"SCN") && op.operands.last().and_then(Object::as_name) == Some(n));
     for n in replaced {
@@ -512,12 +520,10 @@ pub(crate) fn prune_patterns(pat: &mut Dict, replaced: &[Vec<u8>], content: &[Ve
     }
 }
 
-pub(crate) fn prune_extgstates(egs: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>]) {
+pub(crate) fn prune_extgstates(egs: &mut Dict, replaced: &[Vec<u8>], ops: &[Op]) {
     if replaced.is_empty() {
         return;
     }
-    let joined = Pieces::join(content);
-    let ops = joined.parse().ops;
     let still_used = |n: &[u8]| ops.iter().any(|op| op.is("gs") && op.name(0) == Some(n));
     for n in replaced {
         if !still_used(n) {
@@ -1681,7 +1687,10 @@ fn sanitize_stream_form(
     let mut cleaned_res = res.clone();
     let effective_data = new_data.as_deref().unwrap_or(&data);
     let content = [effective_data.to_vec()];
-    inner.apply_resources(doc, &mut cleaned_res, &content);
+    if let Err(error) = inner.apply_resources(doc, &mut cleaned_res, &content) {
+        out.error = Some(error);
+        return StreamOutcome::Unchanged;
+    }
     if new_data.is_some() {
         match prune_properties(doc, &mut cleaned_res, &content) {
             Ok(retired) => out.retired_properties.extend(retired),

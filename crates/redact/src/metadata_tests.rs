@@ -370,3 +370,43 @@ fn removed_uninspectable_form_xobject_clears_metadata_on_limit() {
     assert_eq!(info_value(&saved, "Author"), None);
     assert!(xmp_text(&saved).is_none());
 }
+
+#[test]
+fn removed_glyphs_with_no_known_text_clear_metadata_on_limit() {
+    let clean = packet("<z:clean>Harmless</z:clean>", "");
+    let mut doc =
+        meta_doc(b"BT /F1 10 Tf 10 100 Td <010203> Tj ET", &[("Title", "Project Nightjar"), ("Producer", "Writer 1.0")], Some(&clean), Some(&clean));
+    let font_ref = doc.add(Object::Dict({
+        let mut f = Dict::new();
+        f.set(b"Type".to_vec(), Object::Name(b"Font".to_vec()));
+        f.set(b"Subtype".to_vec(), Object::Name(b"Type1".to_vec()));
+        f.set(b"BaseFont".to_vec(), Object::Name(b"CustomGlyphs".to_vec()));
+        f.set(b"FirstChar".to_vec(), Object::Int(1));
+        f.set(b"LastChar".to_vec(), Object::Int(3));
+        f.set(b"Widths".to_vec(), Object::Array(vec![Object::Int(500), Object::Int(500), Object::Int(500)]));
+        let mut enc = Dict::new();
+        enc.set(b"Type".to_vec(), Object::Name(b"Encoding".to_vec()));
+        enc.set(
+            b"Differences".to_vec(),
+            Object::Array(vec![Object::Int(1), Object::Name(b"g17".to_vec()), Object::Name(b"g18".to_vec()), Object::Name(b"g19".to_vec())]),
+        );
+        f.set(b"Encoding".to_vec(), Object::Dict(enc));
+        f
+    }));
+    let page = pdfcraft_model::pages(&doc).swap_remove(0);
+    let mut res = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
+    let mut fonts = Dict::new();
+    fonts.set(b"F1".to_vec(), Object::Ref(font_ref));
+    res.set(b"Font".to_vec(), Object::Dict(fonts));
+    doc.update_dict(page.obj, |d| d.set(b"Resources".to_vec(), Object::Dict(res))).unwrap();
+
+    mark(&mut doc, 0, &[[0.0, 0.0, 300.0, 300.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.glyphs, 3);
+    assert!(report.metadata_cleared_on_limit);
+    let saved = reopen(&doc);
+    assert_eq!(info_value(&saved, "Title"), None);
+    assert_eq!(info_value(&saved, "Producer"), None);
+    assert!(xmp_text(&saved).is_none());
+    assert!(pdfcraft_model::pages(&saved)[0].dict.get(b"Metadata").is_none());
+}

@@ -119,8 +119,8 @@ pub(crate) struct Scope<'a> {
     /// pass. A run joins across `TJ` kerning numbers (spacing inside one text run: no space, no
     /// split) and across operators when the next removed glyph starts within 1.5 glyph heights
     /// of where the last one's advance (spacing included) landed in device space — a
-    /// repositioning gap past 0.15 heights becomes a space — and splits at kept glyphs, at codes
-    /// with no Unicode meaning, and at page end.
+    /// repositioning gap past 0.15 heights becomes a space — and splits at kept glyphs and at
+    /// page end; a removed glyph whose code has no Unicode meaning triggers `metadata_limited`.
     pub removed_fragments: Vec<String>,
     /// Comparison alternatives for ambiguous forward TJ gaps; the canonical runs above stay
     /// unspaced so intra-word kerning retains its original interpretation.
@@ -1323,9 +1323,9 @@ fn show(scope: &mut Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object]) -> (V
                         if collect {
                             let t = f.decode(&bytes[g.bytes.clone()]);
                             if t.is_empty() {
-                                // A code the font gives no meaning: the run cannot be known to
-                                // continue through it, so each side matches on its own.
-                                scope.flush_run();
+                                // A code the font gives no meaning: what text was removed cannot
+                                // be known, so fail closed and clear all document/page metadata.
+                                scope.limit_metadata();
                                 kerned = false;
                                 drew_removed = false;
                             } else {

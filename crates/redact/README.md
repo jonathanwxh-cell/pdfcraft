@@ -54,8 +54,8 @@ run it cuts out into *fragments*: maximal runs that join across `TJ` kerning num
 inside one text run: no space, no split) **and operators** — text drawn one glyph per operator,
 as many generators do, still collects as one run — whenever the next removed glyph starts within
 1.5 glyph heights of where the last one's advance (character and word spacing included) landed
-in device space; a repositioning gap past 0.15 heights becomes a space, and kept glyphs, codes
-with no Unicode meaning, and page ends still split runs.
+in device space; a repositioning gap past 0.15 heights becomes a space, and kept glyphs and page
+ends still split runs.
 Forward `TJ` displacements can also encode word spacing. Those gaps are optional spaces during
 metadata comparison, retaining the unspaced interpretation for intra-word kerning. Mixed kerns
 and word gaps are compared without enumerating combinations; literal spaces remain required.
@@ -85,9 +85,8 @@ The match errs towards clearing, in both directions:
   repositioning gaps as spaces, so a value that spells the same text with or without one of those
   spaces matches only the spelling the run collected — only glyphs shown in stream order at
   adjacent positions join, so overprint-interleaved, character-batched or logical-order RTL
-  generators still leave one-character runs, and codes with no Unicode meaning still split
-  them — and `/Metadata` on component objects (images, fonts, form XObjects) is not scanned — the
-  same scope as Remove hidden information.
+  generators still leave one-character runs — and `/Metadata` on component objects (images, fonts,
+  form XObjects) is not scanned — the same scope as Remove hidden information.
 
 Matching still requires a complete removed fragment inside a value, or a complete value inside
 a fragment. Partial phrases such as Title `Case: James Bond` after redacting `JAMES BOND IS A SPY`,
@@ -108,7 +107,8 @@ Decoding failures conservatively exhaust the allowance because the decoder does 
 consumed work. These are bounds on this metadata
 pass, not on the whole PDF or the process's memory.
 
-If collection, a value or the shared work/decoding allowance exceeds its limit, the pass removes
+If collection, a value or the shared work/decoding allowance exceeds its limit — or if redaction
+removes a glyph whose code has no Unicode meaning or an uninspectable form XObject — the pass removes
 **all** `/Info` and catalog/page `/Metadata`, including unrelated values and earlier clean packets.
 It never silently truncates needles or treats unfinished matching as clean. The library report's
 `metadata_cleared_on_limit` records this conservative fallback, alongside the actual removal counts;

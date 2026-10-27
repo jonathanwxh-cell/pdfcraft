@@ -1161,8 +1161,12 @@ impl Combiner {
             None => (0..n).collect(),
         };
         let at = crate::page_count(&self.out)?;
+        let mut labels = self.labels.clone();
+        let mut has_labels = self.has_labels;
+        crate::labels::collect_page_labels(src, &pages, at, &mut labels, &mut has_labels)?;
         let imported = import_pages_mapped(&mut self.out, src, &pages, at, self.field_conflicts)?;
-        crate::labels::collect_page_labels(src, &pages, at, &mut self.labels, &mut self.has_labels)?;
+        self.labels = labels;
+        self.has_labels = has_labels;
         self.renamed_fields.extend(imported.renamed_fields);
         if let Some(first) = imported.pages.first() {
             let outline = source_outline(src, imported.page_map);

@@ -4187,6 +4187,118 @@ fn named_page_area_breaks_switch_between_portrait_and_landscape_masters() {
     assert!(is_landscape(&first_form.pages[2]), "breakAfter target switched page 3 back to Page3 landscape");
 }
 
+/// An `overflow` target applies while its subform is laid out (XFA 3.3, "Break on Overflow").
+/// It must not stay selected for a later sibling's untargeted break: that break keeps the
+/// previous master, which is the first eligible area or an explicit `breakBefore` /
+/// `breakAfter` target. A nested overflow ends with its subform, while an ancestor overflow
+/// that is still open keeps applying, and a descendant's explicit break still sticks.
+#[test]
+fn overflow_target_does_not_steer_a_later_untargeted_break() {
+    fn master(page: &Page) -> &'static str {
+        match (page.width.round() as i64, page.height.round() as i64) {
+            (200, 400) => "Body",
+            (180, 360) => "Overflow",
+            (150, 300) => "Special",
+            _ => "other",
+        }
+    }
+    let field = |name: &str, h: &str| format!(r#"<field name="{name}" w="40pt" h="{h}"><ui><textEdit/></ui></field>"#);
+    let kept = field("kept", "20pt");
+    let a = field("a", "80pt");
+    let b = field("b", "80pt");
+    let after = field("after", "20pt");
+    let inner = field("inner", "20pt");
+    let assert_layout = |label: &str, body: &str, masters: &[&str], fields: &[(&str, usize)]| {
+        let xml = format!(
+            r#"<template><subform layout="tb"><pageSet>
+ <pageArea name="Body"><contentArea x="10pt" y="10pt" w="100pt" h="100pt"/><medium short="200pt" long="400pt"/></pageArea>
+ <pageArea name="Overflow"><contentArea x="12pt" y="10pt" w="100pt" h="100pt"/><medium short="180pt" long="360pt"/></pageArea>
+ <pageArea name="Special"><contentArea x="14pt" y="10pt" w="100pt" h="100pt"/><medium short="150pt" long="300pt"/></pageArea>
+</pageSet>{body}</subform></template>"#
+        );
+        let form = layout_xml(&xml).unwrap();
+        let got: Vec<&str> = form.pages.iter().map(master).collect();
+        assert_eq!(got, masters, "{label}");
+        for (name, page) in fields {
+            let found = form.pages.iter().position(|p| widgets(p).iter().any(|w| w.name == *name));
+            assert_eq!(found, Some(*page), "{label}: {name}");
+        }
+        assert!(form.warnings.is_empty(), "{label}: {:?}", form.warnings);
+    };
+
+    // Nothing overflowed, so the target never applies. The sibling's plain page break stays on Body.
+    assert_layout(
+        "unused overflow target",
+        &format!(
+            r#"<subform name="ov" layout="tb"><overflow target="Overflow"/>{kept}</subform><subform name="next" layout="tb"><breakBefore targetType="pageArea"/>{after}</subform>"#
+        ),
+        &["Body", "Body"],
+        &[("kept", 0), ("after", 1)],
+    );
+    // The overflowing fragment uses Overflow. The sibling's untargeted break does not.
+    assert_layout(
+        "taken overflow target",
+        &format!(
+            r#"<subform name="ov" layout="tb"><overflow target="Overflow"/>{a}{b}</subform><subform name="next" layout="tb"><breakBefore targetType="pageArea"/>{after}</subform>"#
+        ),
+        &["Body", "Overflow", "Body"],
+        &[("a", 0), ("b", 1), ("after", 2)],
+    );
+    // This subform's own breakBefore is what later untargeted breaks keep.
+    assert_layout(
+        "breakBefore survives an unused overflow target",
+        &format!(
+            r#"<subform name="ov" layout="tb"><breakBefore target="Special"/><overflow target="Overflow"/>{kept}</subform><subform name="next" layout="tb"><breakBefore targetType="pageArea"/>{after}</subform>"#
+        ),
+        &["Special", "Special"],
+        &[("kept", 0), ("after", 1)],
+    );
+    assert_layout(
+        "breakBefore survives a taken overflow target",
+        &format!(
+            r#"<subform name="ov" layout="tb"><breakBefore target="Special"/><overflow target="Overflow"/>{a}{b}</subform><subform name="next" layout="tb"><breakBefore targetType="pageArea"/>{after}</subform>"#
+        ),
+        &["Special", "Overflow", "Special"],
+        &[("a", 0), ("b", 1), ("after", 2)],
+    );
+    // An untargeted breakAfter is not an overflow, so it must not adopt the overflow master.
+    assert_layout(
+        "untargeted breakAfter",
+        &format!(
+            r#"<subform name="ov" layout="tb"><overflow target="Overflow"/><breakAfter targetType="pageArea"/>{kept}</subform><subform name="next" layout="tb">{after}</subform>"#
+        ),
+        &["Body", "Body"],
+        &[("kept", 0), ("after", 1)],
+    );
+    // An explicit breakAfter still selects its own master after the overflow target is put back.
+    assert_layout(
+        "explicit breakAfter",
+        &format!(
+            r#"<subform name="ov" layout="tb"><overflow target="Overflow"/><breakAfter target="Special"/>{kept}</subform><subform name="next" layout="tb">{after}</subform>"#
+        ),
+        &["Body", "Special"],
+        &[("kept", 0), ("after", 1)],
+    );
+    // A descendant's explicit break sticks, including when it names the same master as the overflow.
+    assert_layout(
+        "descendant break names the overflow master",
+        &format!(
+            r#"<subform name="chapter" layout="tb"><overflow target="Overflow"/><subform name="section" layout="tb"><breakBefore target="Overflow"/>{inner}</subform></subform><subform name="next" layout="tb"><breakBefore targetType="pageArea"/>{after}</subform>"#
+        ),
+        &["Overflow", "Overflow"],
+        &[("inner", 0), ("after", 1)],
+    );
+    // The inner overflow ends with that subform. The outer one is still open, so the sibling uses it.
+    assert_layout(
+        "nested overflow yields to the ancestor",
+        &format!(
+            r#"<subform name="outer" layout="tb"><overflow target="Overflow"/><subform name="inner" layout="tb"><overflow target="Special"/>{kept}</subform><subform name="sib" layout="tb"><breakBefore targetType="pageArea"/>{after}</subform></subform>"#
+        ),
+        &["Body", "Overflow"],
+        &[("kept", 0), ("after", 1)],
+    );
+}
+
 /// A discarded page master must not consume field counts or names, even for a widget too
 /// small to be emitted. Earlier retained pages still own their counts and reservations.
 #[test]

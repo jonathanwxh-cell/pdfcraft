@@ -304,8 +304,12 @@ struct Layouter<'t> {
     /// The flowed subforms being laid out, outermost first: a break between their children
     /// closes their parts on one content area and opens new ones on the next.
     frames: Vec<Frame>,
-    /// The `pageArea` index selected by the most recent explicit break or overflow target.
+    /// The `pageArea` index used for an untargeted new page. Explicit break targets stick.
+    /// An `overflow` target is installed only while its subform is laid out, then the previous
+    /// selection returns unless a later explicit break replaced it (`preferred_epoch`).
     preferred_area: Option<usize>,
+    /// Bumped when an explicit break selects [`Self::preferred_area`].
+    preferred_epoch: u64,
 }
 
 /// How many instances of a repeating subform to lay out: what the data holds once it holds
@@ -356,6 +360,7 @@ pub fn layout(tpl: &Template, data: Option<&DataNode>) -> Result<Form, XfaError>
         leaves: Vec::new(),
         frames: Vec::new(),
         preferred_area: None,
+        preferred_epoch: 0,
     };
     let ctx = Ctx { font: Font::default(), para: Para::default(), som: String::new() };
     l.new_page()?;
@@ -676,6 +681,14 @@ impl Layouter<'_> {
             a.name.as_deref() == Some(leaf) || a.id.as_deref() == Some(leaf) || a.name.as_deref() == Some(raw) || a.id.as_deref() == Some(raw)
         };
         (0..self.areas.len()).find(|&i| matches(&self.areas[i]) && self.areas[i].occur_max.is_none_or(|m| self.uses[i] < m))
+    }
+
+    /// Remember an explicit break target for later untargeted pages. A later explicit break
+    /// replaces it. An `overflow` target may hide it while that subform is open; it returns
+    /// afterwards unless a later explicit break replaced the overflow.
+    fn select_break_area(&mut self, idx: usize) {
+        self.preferred_area = Some(idx);
+        self.preferred_epoch = self.preferred_epoch.saturating_add(1);
     }
 
     fn new_page(&mut self) -> Result<(), XfaError> {
@@ -1110,7 +1123,7 @@ impl Layouter<'_> {
         let prev_rect = self.cursor().0;
         let before_target = sf.break_before_target.as_deref().and_then(|t| self.find_page_area(t));
         if let Some(idx) = before_target {
-            self.preferred_area = Some(idx);
+            self.select_break_area(idx);
         }
         if sf.break_before_page {
             if self.page_has_flow() {
@@ -1121,7 +1134,13 @@ impl Layouter<'_> {
                 self.switch_empty_page(idx)?;
             }
         }
-        if let Some(idx) = sf.overflow_target.as_deref().and_then(|t| self.find_page_area(t)) {
+        // Overflow steers pages created while this subform (and its descendants) are open.
+        // Putting the previous selection back afterwards keeps a later sibling's untargeted
+        // break off this master. A descendant's explicit break bumps `preferred_epoch` and stays.
+        let overflow_area = sf.overflow_target.as_deref().and_then(|t| self.find_page_area(t));
+        let preferred_before_overflow = self.preferred_area;
+        let epoch_at_overflow = self.preferred_epoch;
+        if let Some(idx) = overflow_area {
             self.preferred_area = Some(idx);
         }
         // Data adds instances of a repeating subform (rows added in another viewer).
@@ -1200,10 +1219,13 @@ impl Layouter<'_> {
                 self.finish_frame(frame)?;
             }
         }
+        if overflow_area.is_some() && self.preferred_epoch == epoch_at_overflow {
+            self.preferred_area = preferred_before_overflow;
+        }
         if sf.break_after_page {
             let after_target = sf.break_after_target.as_deref().and_then(|t| self.find_page_area(t));
             if let Some(idx) = after_target {
-                self.preferred_area = Some(idx);
+                self.select_break_area(idx);
             }
             self.break_frames_to(0.0, true, after_target)?;
         }

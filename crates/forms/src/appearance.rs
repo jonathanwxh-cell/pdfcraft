@@ -133,8 +133,11 @@ impl TextBox {
             // As the appearance draws it: the first baseline is 0.85 em below the padded top and
             // a line is drawn while its descent (0.207 em) stays inside the border, so the
             // padding below the last line is not needed: `inner_h` plus 2 pt.
-            let above = wrap_with(&shown, size, self.inner_w, width_of).len().saturating_sub(1) as f64;
-            above * size * 1.15 + 1.057 * size <= self.inner_h + 2.0 + 0.01
+            // Long words break by character, so a line is wider than the box only when it is a
+            // single character wider than the box, which the appearance still cuts at the sides.
+            let lines = wrap_with(&shown, size, self.inner_w, width_of);
+            let above = lines.len().saturating_sub(1) as f64;
+            above * size * 1.15 + 1.057 * size <= self.inner_h + 2.0 + 0.01 && lines.iter().all(|l| width_of(l, size) <= self.inner_w + 0.01)
         } else {
             // A line break in a single-line value is drawn as a space.
             let line: String = shown.chars().map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect();
@@ -477,7 +480,7 @@ fn frame(doc: &Document, wd: &Dict, w: f64, h: f64) -> (String, f64) {
 
 /// Whether `wd` is a check box or radio button PdfCraft laid out for a round XFA check button
 /// (`/PCXfaRound true`, written by the XFA layout).
-fn is_round(doc: &Document, wd: &Dict) -> bool {
+pub(crate) fn is_round(doc: &Document, wd: &Dict) -> bool {
     matches!(wd.get(b"PCXfaRound").map(|o| doc.resolve(o)).as_deref(), Some(Object::Bool(true)))
 }
 
@@ -1026,9 +1029,10 @@ fn check_mark(style: crate::author::CheckStyle, cx: f64, cy: f64, s: f64, color:
 }
 
 /// How a check box or radio button widget `w` of field `f` looks in state on (`on`) or Off when
-/// the file has no appearance for that state: its `/MK` background and border ([`frame`]), and
-/// when on, its caption `/MK /CA` (ISO 32000-2 Table 192: the normal caption, which check boxes
-/// and radio buttons may use too) as a ZapfDingbats character, as in the check box example of
+/// the file has no appearance for that state, or leaves its appearances to the viewer
+/// (`/NeedAppearances`): its `/MK` background and border ([`frame`]), and when on, its caption
+/// `/MK /CA` (ISO 32000-2 Table 192: the normal caption, which check boxes and radio buttons may
+/// use too) as a ZapfDingbats character, as in the check box example of
 /// 12.7.5.2.3: `4` (a check mark) by default, `l` (a dot) for a radio button. The character is
 /// drawn in the `/DA` colour, at the `/DA` size or, for an automatic size (`0 Tf`), filling most
 /// of the box. ZapfDingbats is one of the standard 14 fonts, so no font program is needed.

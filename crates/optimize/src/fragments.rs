@@ -446,6 +446,7 @@ fn merge_page(doc: &mut Document, page: ObjRef, report: &mut Report, progress: &
     Ok(merged)
 }
 
+/// Merge consecutive tiled image fragments across `pages`.
 pub(crate) fn run(doc: &mut Document, pages: &[ObjRef], report: &mut Report, progress: &mut dyn FnMut(Stage) -> bool) -> Result<(), OptimizeError> {
     for p in pages {
         report.fragments_merged += merge_page(doc, *p, report, progress)?;
@@ -459,6 +460,7 @@ mod tests {
 
     use super::*;
 
+    /// Merged dimensions exceeding `u32::MAX` are rejected before allocating pixel buffers.
     #[test]
     fn a_merged_height_beyond_u32_is_refused_before_allocating() {
         // Two fragments, one pixel row each, the top one 2^-48 high: the merged image would be
@@ -507,6 +509,8 @@ mod tests {
         assert!(reads <= 40 * 4 * groups, "{reads} group reads");
     }
 
+    /// Side-by-side vertical strips and 2D tile grids merge into one image XObject while invalid
+    /// or separated runs are handled per run.
     #[test]
     fn side_by_side_and_grid_fragments_merge_into_one_image() {
         let tile = |doc: &mut Document, w: u32, h: u32, px: Vec<u8>| {

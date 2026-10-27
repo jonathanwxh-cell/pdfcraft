@@ -333,17 +333,27 @@ impl PdfCraftApp {
         'pages: for (page, page_info) in doc.info.pages.iter().enumerate() {
             let out = r.render(pdfcraft_render::RenderRequest { page, kind: pdfcraft_render::RequestKind::Text, scale: 1.0, ..Default::default() });
             let Some(text) = out.text else { continue };
-            let hits = match d.mode {
-                SearchMode::Patterns => text.find_with(|c| pdfcraft_engine::find_pattern(d.pattern, c)),
-                _ => needles.iter().flat_map(|w| text.find_opts(w, d.case_sensitive, d.whole_words)).collect(),
-            };
-            for h in hits {
+            let mut push_hit = |h| {
                 let quads: Vec<[f64; 8]> = text.line_rects(h).into_iter().map(|r| page_info.view_rect_to_quad(r)).collect();
                 if !quads.is_empty() {
                     edits.push(self.redact_prefs.mark(page, quads, &author));
-                    if edits.len() >= max_matches {
+                }
+                edits.len() >= max_matches
+            };
+            if d.mode == SearchMode::Patterns {
+                for h in text.find_with(|c| pdfcraft_engine::find_pattern(d.pattern, c)) {
+                    if push_hit(h) {
                         capped = true;
                         break 'pages;
+                    }
+                }
+            } else {
+                for w in &needles {
+                    for h in text.find_opts(w, d.case_sensitive, d.whole_words) {
+                        if push_hit(h) {
+                            capped = true;
+                            break 'pages;
+                        }
                     }
                 }
             }

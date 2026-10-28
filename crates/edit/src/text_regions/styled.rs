@@ -613,6 +613,30 @@ fn untouched_rows(block: &TextBlock, draft: &str, rows: &[std::ops::Range<usize>
         .collect()
 }
 
+fn segment_underline_runs(
+    widths: &[f64],
+    segment_width: f64,
+    x: f64,
+    default_style: usize,
+    row_styles: Option<&[Option<usize>]>,
+    pos: usize,
+) -> Vec<(usize, f64, f64)> {
+    let width_sum = widths.iter().copied().sum::<f64>();
+    let width_scale = if width_sum > 1e-6 { segment_width / width_sum } else { 0.0 };
+    let mut cursor = x;
+    let mut runs: Vec<(usize, f64, f64)> = Vec::new();
+    for (offset, width) in widths.iter().enumerate() {
+        let style_index = row_styles.and_then(|styles| styles.get(pos.saturating_add(offset))).and_then(|style| *style).unwrap_or(default_style);
+        let next = cursor + *width * width_scale;
+        match runs.last_mut() {
+            Some((prev, _, to)) if *prev == style_index => *to = next,
+            _ => runs.push((style_index, cursor, next)),
+        }
+        cursor = next;
+    }
+    runs
+}
+
 /// Keep spaces in a subset without a space glyph attached to an adjacent glyph-bearing segment on
 /// the same row so `source_show` wraps them in one `/ActualText` span (#4229).
 ///
@@ -995,44 +1019,23 @@ pub(crate) fn rewrite_styled_block(
             }
             // A space reassigned onto a neighbour keeps that neighbour's grouping key, and its
             // own style for the underline. Stroke each run of one underline style separately.
-            let underline_at = |offset: usize| -> usize {
-                space_styles.get(row_index).and_then(|styles| styles.get(pos.saturating_add(offset))).and_then(|style| *style).unwrap_or(item.1)
-            };
             let widths = char_advances.get(&(row_index, pos)).map(Vec::as_slice).unwrap_or(&[]);
-            let width_sum = widths.iter().copied().sum::<f64>();
-            let width_scale = if width_sum > 1e-6 { segment_width / width_sum } else { 0.0 };
-            let mut cursor = x;
-            let mut run: Option<(usize, f64)> = None;
-            let flush_underline = |ops: &mut Vec<Op>, style_index: usize, from: f64, to: f64| {
+            for (style_index, from, to) in
+                segment_underline_runs(widths, segment_width, x, item.1, space_styles.get(row_index).map(Vec::as_slice), pos)
+            {
                 let source = lines.get(style_index).unwrap_or(first);
                 if underlines.get(&style_index).copied().or(style.underline) != Some(true) || to <= from {
-                    return;
+                    continue;
                 }
                 let [r, g, b] = overrides.get(&style_index).and_then(|r| r.color).or(style.color).unwrap_or(source.color);
                 let underline_size = size_of(source, style_index) * source.origin.k;
                 let (x0, y0) = back.apply(from - o.ctm[4], baseline - o.ctm[5] - underline_size * 0.12);
                 let (x1, y1) = back.apply(to - o.ctm[4], baseline - o.ctm[5] - underline_size * 0.12);
-                ops.push(Op::new("RG", vec![n(r), n(g), n(b)]));
-                ops.push(Op::new("w", vec![n(underline_size * 0.06 / o.ctm[2].hypot(o.ctm[3]).max(1e-6))]));
-                ops.push(Op::new("m", vec![n(x0), n(y0)]));
-                ops.push(Op::new("l", vec![n(x1), n(y1)]));
-                ops.push(Op::new("S", vec![]));
-            };
-            for (offset, width) in widths.iter().enumerate() {
-                let style_index = underline_at(offset);
-                let next = cursor + *width * width_scale;
-                match run {
-                    Some((prev, from)) if prev == style_index => run = Some((prev, from)),
-                    Some((prev, from)) => {
-                        flush_underline(&mut block_ops, prev, from, cursor);
-                        run = Some((style_index, cursor));
-                    }
-                    None => run = Some((style_index, cursor)),
-                }
-                cursor = next;
-            }
-            if let Some((style_index, from)) = run {
-                flush_underline(&mut block_ops, style_index, from, cursor);
+                block_ops.push(Op::new("RG", vec![n(r), n(g), n(b)]));
+                block_ops.push(Op::new("w", vec![n(underline_size * 0.06 / o.ctm[2].hypot(o.ctm[3]).max(1e-6))]));
+                block_ops.push(Op::new("m", vec![n(x0), n(y0)]));
+                block_ops.push(Op::new("l", vec![n(x1), n(y1)]));
+                block_ops.push(Op::new("S", vec![]));
             }
             block_ops.push(Op::new("Q", vec![]));
             x += segment_width;

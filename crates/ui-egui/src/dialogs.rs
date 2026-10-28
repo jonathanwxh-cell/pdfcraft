@@ -1778,12 +1778,8 @@ fn finish_edits(app: &mut PdfCraftApp, dialog: Dialog, req: &mut Pending) {
         app.apply_edit(edit);
         app.boxes_draft.seeded = None;
     }
-<<<<<<< HEAD
-    if protect_now && app.apply_edit(app.protect_draft.edit()) {
-=======
     if req.protect_now && app.apply_edit(app.protect_draft.edit()) {
         app.protect_draft = Default::default();
->>>>>>> upstream/main
         app.notify_tr("Password protection will be applied when you save");
     }
     if req.apply_number

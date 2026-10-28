@@ -831,7 +831,7 @@ impl Walk {
             self.painted_patterns.extend(self.gs.fill_pattern.iter().cloned());
             self.painted_patterns.extend(self.gs.stroke_pattern.iter().cloned());
         }
-        let new = replacement?;
+        let Some(new) = replacement else { return Some(op) };
         piece.changed = true;
         piece.ops.extend(new);
         None

@@ -1,7 +1,29 @@
 use super::changes::classify_changes;
 use super::listing::{DigestCache, Field, list, nums, sig_fields, text};
 use super::types::{Detail, Fill, Modification, Status, TrustStore};
-use super::*;
+use super::{
+    Certificate, Dict, DigestAlg, Document, HashSet, ObjRef, Object, SignError, SignatureInfo, SignedData, Time, build_chain, build_chain_noted,
+};
+
+/// Inputs and output target for validating one signature or document timestamp.
+pub(super) struct SignatureValidation<'a> {
+    pub(super) doc: &'a Document,
+    pub(super) bytes: &'a [u8],
+    pub(super) trust: &'a TrustStore,
+    pub(super) field: Option<&'a Field>,
+    pub(super) stamp_ref: Option<ObjRef>,
+    pub(super) info: &'a mut SignatureInfo,
+    pub(super) cache: &'a DigestCache,
+}
+
+/// Cryptographically verified signature material before chain, trust, and change checks.
+struct VerifiedSignature<'a> {
+    covered: usize,
+    certificate: Certificate,
+    embedded: &'a [Certificate],
+    cms_time: Option<Time>,
+    unverified_time: Option<Time>,
+}
 
 /// Validate one signature dictionary.
 pub fn validate(doc: &Document, bytes: &[u8], trust: &TrustStore, field: &str) -> Option<SignatureInfo> {
@@ -33,16 +55,19 @@ fn docmdp(doc: &Document, v: &Dict) -> Option<u8> {
         .map(|r| r.get(b"TransformParams").map(|p| doc.resolve(p)).and_then(|p| p.as_dict().and_then(|p| p.int(b"P"))).unwrap_or(2).clamp(1, 3) as u8)
 }
 
+/// Whether `covered` spans the entire file (ignoring trailing whitespace and NUL padding).
 fn whole_file(bytes: &[u8], covered: usize) -> bool {
     covered == bytes.len() || bytes.get(covered..).is_some_and(|rest| rest.iter().all(|b| b.is_ascii_whitespace() || *b == 0))
 }
 
+/// The raw bytes of `d`'s `/Contents` string.
 fn dict_contents(doc: &Document, d: &Dict) -> Option<Vec<u8>> {
     let contents = d.get(b"Contents").map(|c| doc.resolve(c))?;
     let s = contents.as_string()?;
     if s.hex { Some(s.bytes.clone()) } else { unhex(&s.bytes) }
 }
 
+/// Locate the signature or standalone timestamp dictionary in an earlier revision `rev`.
 fn find_sig_in_revision(rev: &Document, field: Option<&Field>, stamp_ref: Option<ObjRef>) -> Option<Dict> {
     if let Some(f) = field {
         // A later field that reuses the name is a different field. Match the object when we
@@ -66,51 +91,36 @@ fn find_sig_in_revision(rev: &Document, field: Option<&Field>, stamp_ref: Option
 
 /// The revision in which this signature or timestamp first appeared (when an earlier revision
 /// already holds it), or the current document.
-fn earliest_signed_dict(
-    doc: &Document,
-    bytes: &[u8],
-    cache: &DigestCache,
-    field: Option<&Field>,
-    stamp_ref: Option<ObjRef>,
-    v: &Dict,
-) -> (Document, Dict) {
-    let ends = doc.revision_ends();
+fn earliest_signed_dict(context: &SignatureValidation<'_>, v: &Dict) -> (Document, Dict) {
+    let ends = context.doc.revision_ends();
     if ends.len() > 1 {
         for &end in &ends[..ends.len() - 1] {
-            if end < bytes.len()
-                && !whole_file(bytes, end)
-                && let Some(old) = cache.revision(doc, bytes, end)
-                && let Some(old_v) = find_sig_in_revision(&old, field, stamp_ref)
+            if end < context.bytes.len()
+                && !whole_file(context.bytes, end)
+                && let Some(old) = context.cache.revision(context.doc, context.bytes, end)
+                && let Some(old_v) = find_sig_in_revision(&old, context.field, context.stamp_ref)
             {
                 return (old, old_v);
             }
         }
     }
-    (doc.clone(), v.clone())
+    (context.doc.clone(), v.clone())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn validate_into(
-    doc: &Document,
-    bytes: &[u8],
-    trust: &TrustStore,
-    field: Option<&Field>,
-    stamp_ref: Option<ObjRef>,
-    v: &Dict,
-    info: &mut SignatureInfo,
-    cache: &DigestCache,
-) {
-    let (mut sig_doc, mut sig_v) = earliest_signed_dict(doc, bytes, cache, field, stamp_ref, v);
+/// Validate a signature field's dictionary `v` and record the verdict in `context.info`.
+pub(super) fn validate_into(context: SignatureValidation<'_>, v: &Dict) {
+    let (mut sig_doc, mut sig_v) = earliest_signed_dict(&context, v);
     // A document timestamp can also be the value of a signature field (Documenso writes
     // `Timestamp_1` that way). Its `/Contents` is a bare RFC 3161 token, not a signature over the
     // document, so it must not be read as one.
     if is_doc_timestamp(&sig_v) || is_doc_timestamp(v) {
-        info.sub_filter = Some("ETSI.RFC3161".to_string());
-        info.doc_timestamp = true;
-        info.timestamp = true;
-        validate_doc_timestamp(doc, bytes, field, stamp_ref, v, info, cache, trust);
+        context.info.sub_filter = Some("ETSI.RFC3161".to_string());
+        context.info.doc_timestamp = true;
+        context.info.timestamp = true;
+        validate_doc_timestamp(context, v);
         return;
     }
+    let SignatureValidation { doc, bytes, trust, field, stamp_ref, info, cache } = context;
     let fill_metadata = |d_doc: &Document, d_v: &Dict, info: &mut SignatureInfo| {
         info.date = text(d_doc, d_v, b"M");
         info.reason = text(d_doc, d_v, b"Reason");
@@ -132,7 +142,7 @@ pub(super) fn validate_into(
     let [o0, l0, o1, l1] = [br[0] as usize, br[1] as usize, br[2] as usize, br[3] as usize];
     if o0 != 0 || o1 < l0 || o1.checked_add(l1).is_none_or(|end| end > bytes.len()) || o1 - l0 < 2 {
         return invalid(info, Detail::plain("The signature's byte range does not match the file."));
-    }
+    };
     let gap = &bytes[l0..o1];
     if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
         return invalid(info, Detail::plain("The signature's byte range does not exclude exactly its contents."));
@@ -168,7 +178,13 @@ pub(super) fn validate_into(
         info.details.push(Detail::of("PdfCraft can't check this signature yet: {}.", Fill::Reason(why.to_owned())));
     };
     if info.sub_filter.as_deref() == Some("adbe.x509.rsa_sha1") {
-        return validate_x509_rsa_sha1(doc, &sig_doc, bytes, trust, &sig_v, info, cache, (l0, o1, covered), &contents);
+        return validate_x509_rsa_sha1(
+            SignatureValidation { doc, bytes, trust, field, stamp_ref, info, cache },
+            &sig_doc,
+            &sig_v,
+            (l0, o1, covered),
+            &contents,
+        );
     }
     let sd = match SignedData::parse(&contents) {
         Ok(sd) => sd,
@@ -278,24 +294,17 @@ pub(super) fn validate_into(
             return invalid(info, Detail::of("The signature could not be checked ({}).", Fill::Reason(e.to_string())));
         }
     }
-    finish_validation(doc, bytes, trust, info, cache, covered, cert, &sd.certificates, s.signing_time, unverified_time);
+    finish_validation(
+        SignatureValidation { doc, bytes, trust, field, stamp_ref, info, cache },
+        VerifiedSignature { covered, certificate: cert, embedded: &sd.certificates, cms_time: s.signing_time, unverified_time },
+    );
 }
 
 /// The verdict once the signature value has been checked: chain and trust, the signing time
 /// against the certificate's validity, and what later revisions changed.
-#[allow(clippy::too_many_arguments)]
-fn finish_validation(
-    doc: &Document,
-    bytes: &[u8],
-    trust: &TrustStore,
-    info: &mut SignatureInfo,
-    cache: &DigestCache,
-    covered: usize,
-    cert: Certificate,
-    embedded: &[Certificate],
-    cms_time: Option<Time>,
-    unverified_time: Option<Time>,
-) {
+fn finish_validation(context: SignatureValidation<'_>, verified: VerifiedSignature<'_>) {
+    let SignatureValidation { doc, bytes, trust, info, cache, .. } = context;
+    let VerifiedSignature { covered, certificate: cert, embedded, cms_time, unverified_time } = verified;
     info.signing_time = cms_time.or_else(|| info.date.as_deref().and_then(Time::from_pdf));
     let mut pool = embedded.to_vec();
     pool.extend(trust.certs.iter().cloned());
@@ -536,20 +545,11 @@ fn check_dss_revocation(doc: &Document, signer: Option<&Certificate>, at: &Optio
     }
 }
 
-/// Validate a standalone document timestamp dictionary (`/ETSI.RFC3161`): the token must be
-/// cryptographically valid and its message imprint must cover the file's signed bytes.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn validate_doc_timestamp(
-    doc: &Document,
-    bytes: &[u8],
-    field: Option<&Field>,
-    stamp_ref: Option<ObjRef>,
-    v: &Dict,
-    info: &mut SignatureInfo,
-    cache: &DigestCache,
-    trust: &TrustStore,
-) {
-    let (mut sig_doc, mut sig_v) = earliest_signed_dict(doc, bytes, cache, field, stamp_ref, v);
+/// Validate a standalone or field document timestamp dictionary (`/ETSI.RFC3161`): the token must
+/// be cryptographically valid and its message imprint must cover the file's signed bytes.
+pub(super) fn validate_doc_timestamp(context: SignatureValidation<'_>, v: &Dict) {
+    let (mut sig_doc, mut sig_v) = earliest_signed_dict(&context, v);
+    let SignatureValidation { doc, bytes, trust, field, stamp_ref, info, cache } = context;
     info.date = text(&sig_doc, &sig_v, b"M");
     let invalid = |info: &mut SignatureInfo, why: Detail| {
         info.status = Status::Invalid;
@@ -694,18 +694,8 @@ pub(crate) fn signature_contents(doc: &Document) -> Vec<Vec<u8>> {
 /// `adbe.x509.rsa_sha1` (ISO 32000-2 §12.8.3.2, deprecated): `/Contents` is the PKCS #1
 /// signature as a DER OCTET STRING over the SHA-1 digest of the byte ranges, and `/Cert` holds the
 /// signer's certificate (then any others) as DER byte strings.
-#[allow(clippy::too_many_arguments)]
-fn validate_x509_rsa_sha1(
-    doc: &Document,
-    sig_doc: &Document,
-    bytes: &[u8],
-    trust: &TrustStore,
-    v: &Dict,
-    info: &mut SignatureInfo,
-    cache: &DigestCache,
-    (l0, o1, covered): (usize, usize, usize),
-    contents: &[u8],
-) {
+fn validate_x509_rsa_sha1(context: SignatureValidation<'_>, sig_doc: &Document, v: &Dict, (l0, o1, covered): (usize, usize, usize), contents: &[u8]) {
+    let SignatureValidation { doc, bytes, trust, field, stamp_ref, info, cache } = context;
     let fail = |info: &mut SignatureInfo, why: Detail| {
         info.status = Status::Invalid;
         info.details.push(why);
@@ -752,5 +742,8 @@ fn validate_x509_rsa_sha1(
     }
     info.details.push(Detail::plain("The signature uses the legacy adbe.x509.rsa_sha1 format."));
     info.details.extend(DigestAlg::Sha1.weakness().map(Detail::plain));
-    finish_validation(doc, bytes, trust, info, cache, covered, cert, &certs, None, None);
+    finish_validation(
+        SignatureValidation { doc, bytes, trust, field, stamp_ref, info, cache },
+        VerifiedSignature { covered, certificate: cert, embedded: &certs, cms_time: None, unverified_time: None },
+    );
 }

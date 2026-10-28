@@ -607,14 +607,13 @@ impl TimestampAuthority for TestTsa {
     fn timestamp(&self, request: &[u8]) -> Result<Vec<u8>, SignError> {
         let q = pdfcraft_sign::timestamp::parse_request(request)?;
         pdfcraft_sign::timestamp::respond(
-            &self.id.key,
-            &self.id.certificate,
-            &self.id.chain,
-            pdfcraft_sign::DigestAlg::Sha256,
-            &q,
-            "1.2.3.4",
-            self.time,
-            7,
+            pdfcraft_sign::timestamp::TimestampSigner {
+                key: &self.id.key,
+                certificate: &self.id.certificate,
+                chain: &self.id.chain,
+                digest: pdfcraft_sign::DigestAlg::Sha256,
+            },
+            pdfcraft_sign::timestamp::TimestampIssuance { query: &q, policy: "1.2.3.4", generation_time: self.time, serial: 7 },
         )
     }
 }
@@ -1977,8 +1976,16 @@ fn a_timestamp_token_may_sign_with_a_different_digest_than_its_imprint() {
     let imprint = pdfcraft_sign::DigestAlg::Sha1.digest(&[b"document"]);
     let q = pdfcraft_sign::timestamp::TimestampQuery::new(pdfcraft_sign::DigestAlg::Sha1, imprint.clone()).unwrap();
     let time = Time { year: 2026, month: 10, day: 6, hour: 12, minute: 0, second: 0 };
-    let resp =
-        pdfcraft_sign::timestamp::respond(&tsa.key, &tsa.certificate, &tsa.chain, pdfcraft_sign::DigestAlg::Sha256, &q, "1.2.3.4", time, 9).unwrap();
+    let resp = pdfcraft_sign::timestamp::respond(
+        pdfcraft_sign::timestamp::TimestampSigner {
+            key: &tsa.key,
+            certificate: &tsa.certificate,
+            chain: &tsa.chain,
+            digest: pdfcraft_sign::DigestAlg::Sha256,
+        },
+        pdfcraft_sign::timestamp::TimestampIssuance { query: &q, policy: "1.2.3.4", generation_time: time, serial: 9 },
+    )
+    .unwrap();
     let token = pdfcraft_sign::timestamp::parse_response(&resp, &q).unwrap();
     assert_eq!((token.digest, token.imprint, token.gen_time), (pdfcraft_sign::DigestAlg::Sha1, imprint, time));
 }
@@ -1986,7 +1993,7 @@ fn a_timestamp_token_may_sign_with_a_different_digest_than_its_imprint() {
 /// A token answers the request that asked for it: a requested nonce or policy must come back.
 #[test]
 fn a_timestamp_response_must_carry_the_requested_nonce_and_policy() {
-    use pdfcraft_sign::timestamp::{TimestampQuery, parse_response, respond};
+    use pdfcraft_sign::timestamp::{TimestampIssuance, TimestampQuery, TimestampSigner, parse_response, respond};
     let tsa = pkcs12::open(&data("rsa-aes.p12"), "test").unwrap();
     let alg = pdfcraft_sign::DigestAlg::Sha256;
     let time = Time { year: 2026, month: 10, day: 6, hour: 12, minute: 0, second: 0 };
@@ -1995,7 +2002,13 @@ fn a_timestamp_response_must_carry_the_requested_nonce_and_policy() {
         (q.nonce, q.policy) = (nonce, policy.map(str::to_string));
         q
     };
-    let answer = |q: &TimestampQuery| respond(&tsa.key, &tsa.certificate, &tsa.chain, alg, q, "1.2.3.4", time, 9).unwrap();
+    let answer = |q: &TimestampQuery| {
+        respond(
+            TimestampSigner { key: &tsa.key, certificate: &tsa.certificate, chain: &tsa.chain, digest: alg },
+            TimestampIssuance { query: q, policy: "1.2.3.4", generation_time: time, serial: 9 },
+        )
+        .unwrap()
+    };
     let with_nonce = answer(&query(Some(42), None));
     assert!(parse_response(&with_nonce, &query(Some(42), Some("1.2.3.4"))).is_ok());
     assert!(parse_response(&with_nonce, &query(None, None)).is_ok());
@@ -3107,16 +3120,40 @@ fn signed_signature_objects_and_byte_ranges_are_read_from_the_signed_revision() 
 }
 
 /// Under DocMDP `P = 1` (no changes permitted), adding a signature field or counter-signing an
-/// existing unsigned signature field invalidates the certifying signature (#3998).
+/// existing unsigned signature field invalidates the certifying signature, whereas adding an
+/// RFC 3161 document timestamp (PAdES-LTA) remains permitted (#3998).
 #[test]
 fn certify_level_one_forbids_adding_signature_fields_or_counter_signing() {
     let id = pkcs12::open(&data("ec-p256.p12"), "test").unwrap();
-    let trust = TrustStore { certs: vec![id.certificate.clone()] };
+    let tsa = TestTsa { id: tsa_id(), time: Time { year: 2026, month: 10, day: 6, hour: 12, minute: 0, second: 0 } };
+    let trust = TrustStore { certs: vec![id.certificate.clone(), tsa.id.certificate.clone()] };
     let certified_p1 = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { certify: Some(1), ..opts() }).unwrap();
     let counter_p1 = pdfcraft_sign::sign(&open(&certified_p1), &id, &SignOptions { field: Some("Approval".into()), ..opts() }).unwrap();
     let first_p1 = signatures(&open(&counter_p1), &counter_p1, &trust).into_iter().find(|s| s.field == "Signature1").unwrap();
     assert_eq!(first_p1.status, Status::Invalid, "{:?}", first_p1.modification);
     assert_eq!(first_p1.modification, Modification::Disallowed(vec![kind::SIGNATURE]));
+
+    // Adding an RFC 3161 document timestamp to a P = 1 certified document is permitted for
+    // long-term validation and keeps the certifying signature valid.
+    let stamped_p1 = pdfcraft_sign::timestamp_document(&open(&certified_p1), &tsa, "D:20261006120000Z").unwrap();
+    let stamped_sigs = signatures(&open(&stamped_p1), &stamped_p1, &trust);
+    let cert_after_ts = stamped_sigs.iter().find(|s| s.field == "Signature1").unwrap();
+    assert_eq!(cert_after_ts.status, Status::Valid, "{:?}", cert_after_ts.modification);
+    assert!(matches!(&cert_after_ts.modification, Modification::Allowed(k) if k.contains(&kind::SIGNATURE)), "{:?}", cert_after_ts.modification);
+    let doc_ts = stamped_sigs.iter().find(|s| s.doc_timestamp).unwrap();
+    assert_eq!(doc_ts.status, Status::Valid, "{:?}", doc_ts.details);
+
+    // Dropping `/Perms` from the catalog after certification is a structure change.
+    let dropped_perms = edit_after(&certified_p1, |doc| {
+        let root = doc.root().unwrap();
+        doc.update_dict(root, |c| {
+            c.remove(b"Perms");
+        })
+        .unwrap();
+    });
+    let after_drop = signatures(&open(&dropped_perms), &dropped_perms, &trust).into_iter().find(|s| s.field == "Signature1").unwrap();
+    assert_eq!(after_drop.status, Status::Invalid, "{:?}", after_drop.modification);
+    assert_eq!(after_drop.modification, Modification::Disallowed(vec![kind::STRUCTURE]));
 
     // Under P = 2 (filling forms and signing allowed), the same counter-signature is permitted.
     let certified_p2 = pdfcraft_sign::sign(&open(&fixture()), &id, &SignOptions { certify: Some(2), ..opts() }).unwrap();

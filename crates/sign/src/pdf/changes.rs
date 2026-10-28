@@ -1,6 +1,6 @@
 use super::listing::sig_fields;
 use super::types::{Modification, kind};
-use super::*;
+use super::{Arc, Dict, Document, HashMap, HashSet, ObjRef, Object};
 
 /// What later revisions changed, classified as Acrobat reports it, under DocMDP `p` (or none:
 /// an approval signature permits form fill, comments and further signatures).
@@ -45,31 +45,7 @@ pub(super) fn classify_changes(doc: &Document, old: Option<Document>, p: Option<
     // Signature fields and widgets in the signed revision: those already signed must never be
     // altered later, whereas an unsigned signature field or widget in the signed revision may be
     // signed later (under P != 1).
-    let mut signed_sig_widgets: HashSet<ObjRef> = HashSet::new();
-    let mut signed_sig_fields: HashSet<ObjRef> = HashSet::new();
-    let mut unsigned_sig_objects: HashSet<ObjRef> = HashSet::new();
-    for f in sig_fields(&old) {
-        if let Some(v) = f.signature(&old) {
-            signed_sig_fields.extend(f.r);
-            if let Some(vr) = f.dict.get(b"V").and_then(Object::as_ref) {
-                signed_sig_fields.insert(vr);
-            }
-            if let Some(refs) = v.get(b"Reference").map(|o| old.resolve(o)).and_then(|o| o.as_array().cloned()) {
-                for entry in &refs {
-                    if let Some(er) = entry.as_ref() {
-                        signed_sig_fields.insert(er);
-                    }
-                    if let Some(tr) = old.resolve(entry).as_dict().and_then(|d| d.get(b"TransformParams").and_then(Object::as_ref)) {
-                        signed_sig_fields.insert(tr);
-                    }
-                }
-            }
-            signed_sig_widgets.extend(f.widgets.iter().filter_map(|(r, _)| *r));
-        } else {
-            unsigned_sig_objects.extend(f.r);
-            unsigned_sig_objects.extend(f.widgets.iter().filter_map(|(r, _)| *r));
-        }
-    }
+    let (signed_sig_widgets, signed_sig_fields, unsigned_sig_objects) = signed_sig_roles(&old);
     // What each signed page draws from, by the role it held when signed (#1787).
     let signed_resources = signed_page_resources(&old, &signed_pages);
     let old_info = old.trailer().get(b"Info").and_then(Object::as_ref);
@@ -109,6 +85,23 @@ pub(super) fn classify_changes(doc: &Document, old: Option<Document>, p: Option<
     if pdfcraft_annot::page_refs(doc).ok().as_ref() != Some(&old_page_list) && !disallowed.contains(&kind::PAGES) {
         disallowed.push(kind::PAGES);
     }
+    let classifier = ChangedObjectClassifier {
+        doc,
+        old: &old,
+        old_content: &old_content,
+        old_metadata,
+        old_acroform,
+        old_xfa_data: &old_xfa_data,
+        signed_pages: &signed_pages,
+        signed_page_tree: &signed_page_tree,
+        signed_annots: &signed_annots,
+        signed_sig_widgets: &signed_sig_widgets,
+        signed_sig_fields: &signed_sig_fields,
+        unsigned_sig_objects: &unsigned_sig_objects,
+        signed_resources: &signed_resources,
+        old_info,
+        dss: &dss,
+    };
     for num in doc.object_numbers() {
         if same_place(num) {
             continue;
@@ -130,88 +123,8 @@ pub(super) fn classify_changes(doc: &Document, old: Option<Document>, p: Option<
         // graphics state does not make that a form fill. A container (the resources dictionary,
         // a category dictionary) that kept every entry it had and only gained names changes
         // nothing the signed content draws, and is judged as before.
-        let kept_entries = |d: &Dict| before.as_deref().and_then(Object::as_dict).is_some_and(|b| b.iter().all(|(k, v)| d.get(k) == Some(v)));
-        let resource_kind = match (signed_resources.get(&r), &*new) {
-            (Some(false), _) => Some(kind::PAGE_CONTENT),
-            (Some(true), Object::Dict(d)) if kept_entries(d) => None,
-            (Some(true), _) => Some(kind::PAGE_CONTENT),
-            (None, _) => None,
-        };
-        let what = match (resource_kind, &*new) {
-            (Some(k), _) => k,
-            // The Document Security Store's own arrays and dictionaries, when they only grew.
-            (_, _) if dss.contains(&num) => kind::SECURITY_STORE,
-            (_, _) if signed_page_tree.contains(&r) => kind::PAGES,
-            (_, _) if signed_sig_widgets.contains(&r) => kind::PAGE_CONTENT,
-            (_, _) if signed_sig_fields.contains(&r) => kind::OTHER,
-            (_, Object::Dict(d)) if Some(r) == old.root() => catalog_change_kind(doc, &old, d, before.as_deref().and_then(Object::as_dict)),
-            (_, _) if Some(r) == old.root() => kind::STRUCTURE,
-            (_, Object::Dict(d)) if signed_pages.contains(&r) => page_change_kind(doc, &old, d, before.as_deref().and_then(Object::as_dict)),
-            (_, _) if signed_pages.contains(&r) => kind::PAGE_CONTENT,
-            // A signed page's indirect /Annots array, still an array: what it lost, then what it
-            // gained. Dropping a signed annotation is never hidden behind an added signature.
-            (_, Object::Array(now)) if signed_annots.contains(&r) && before.as_deref().is_some_and(|b| b.as_array().is_some()) => {
-                let was: HashSet<ObjRef> =
-                    before.as_deref().and_then(Object::as_array).map(|a| a.iter().filter_map(Object::as_ref).collect()).unwrap_or_default();
-                let kept: HashSet<ObjRef> = now.iter().filter_map(Object::as_ref).collect();
-                let removed: Vec<ObjRef> = was.iter().filter(|r| !kept.contains(r)).copied().collect();
-                if removed.is_empty() {
-                    let added: Vec<ObjRef> = now.iter().filter_map(Object::as_ref).filter(|r| !was.contains(r)).collect();
-                    added_annots(doc, &added)
-                } else if removed.iter().any(|r| old.get(*r).as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Widget"))) {
-                    // A form field or signature widget taken off the page: no permission covers it.
-                    kind::OTHER
-                } else {
-                    // Deleting comments is a comment change (permitted at P 3 only).
-                    kind::COMMENTS
-                }
-            }
-            (_, Object::Dict(d)) => {
-                let was = before.as_deref().and_then(Object::as_dict);
-                if was.is_some() && Some(r) == old_acroform {
-                    acroform_kind(doc, &old, d, was)
-                } else if was.is_some() && Some(r) == old_info {
-                    // Only the signed revision's own /Info dictionary is a metadata change.
-                    kind::METADATA
-                } else {
-                    change_kind(doc, &old, d, was, unsigned_sig_objects.contains(&r))
-                }
-            }
-            (_, Object::Stream(s)) => {
-                // File plumbing is what the stream was when signed: the /Type it has now is
-                // written by whoever changed it, and the renderer ignores /Type (a page's Form
-                // XObject relabelled /ObjStm still draws its new content).
-                let was_plumbing = matches!(before.as_deref(), Some(Object::Stream(b)) if matches!(b.dict.name(b"Type"), Some(b"XRef" | b"ObjStm")));
-                if old_content.contains(&r) {
-                    kind::PAGE_CONTENT
-                } else if before.is_none() || was_plumbing {
-                    continue;
-                } else if s.dict.name(b"Type") == Some(b"Metadata") && Some(r) == old_metadata {
-                    // Only the signed catalog's XMP stream. A /Type /Metadata label on anything
-                    // else, even one it already had when signed (a page's Form XObject: the
-                    // renderer ignores /Type), does not make rewriting it a metadata change.
-                    kind::METADATA
-                } else if old_xfa_data.contains(&r) {
-                    // The form's XFA data (`datasets`) or state (`form`) as the signed revision
-                    // named it: filling an XFA form rewrites these, as a Reader Extensions (UR3)
-                    // save of a certified form does (#2759). The role comes from the signed
-                    // revision, so a later one can't name page content as XFA data.
-                    kind::FORM_FILL
-                } else {
-                    kind::OTHER
-                }
-            }
-            _ if before.is_none() => continue,
-            _ => kind::OTHER,
-        };
-        let ok = match (what, p) {
-            (kind::SECURITY_STORE, _) => true,
-            (kind::SIGNATURE | kind::FORM_FILL, Some(2 | 3) | None) => true,
-            (kind::COMMENTS, Some(3) | None) => true,
-            // Every save updates /Info (ModDate), signing included.
-            (kind::METADATA, _) => true,
-            _ => false,
-        };
+        let Some(change) = classifier.classify(r, &new, before.as_deref()) else { continue };
+        let (what, ok) = change.verdict(p);
         let list = if ok { &mut allowed } else { &mut disallowed };
         if !list.contains(&what) {
             list.push(what);
@@ -222,30 +135,76 @@ pub(super) fn classify_changes(doc: &Document, old: Option<Document>, p: Option<
     // rewritten by every save and is not a change.
     let current: HashSet<u32> = doc.object_numbers().into_iter().collect();
     for num in old.object_numbers().into_iter().filter(|n| !current.contains(n)) {
-        let r = ObjRef { num, generation: old.generation(num) };
-        let was = old.get(r);
-        let page_role = old_content.contains(&r) || signed_pages.contains(&r) || signed_resources.contains_key(&r) || signed_sig_widgets.contains(&r);
-        let struct_role = Some(r) == old.root();
-        let pages_role = signed_page_tree.contains(&r);
-        let signed_role = page_role || struct_role || pages_role;
-        // A signed page's content or resource is judged by that role, whatever /Type its stream carried.
-        if !signed_role && matches!(&*was, Object::Stream(s) if matches!(s.dict.name(b"Type"), Some(b"XRef" | b"ObjStm"))) {
-            continue;
-        }
-        let what = if struct_role {
-            kind::STRUCTURE
-        } else if pages_role {
-            kind::PAGES
-        } else if page_role {
-            kind::PAGE_CONTENT
-        } else {
-            kind::OTHER
-        };
-        if !disallowed.contains(&what) {
+        if let Some(what) = classifier.classify_freed(num)
+            && !disallowed.contains(&what)
+        {
             disallowed.push(what);
         }
     }
     if disallowed.is_empty() { Modification::Allowed(allowed) } else { Modification::Disallowed(disallowed) }
+}
+
+/// Partition the signed revision's signature objects into signed widgets, signed field/value/policy
+/// objects, and unsigned signature fields/widgets.
+fn signed_sig_roles(old: &Document) -> (HashSet<ObjRef>, HashSet<ObjRef>, HashSet<ObjRef>) {
+    let mut signed_sig_widgets: HashSet<ObjRef> = HashSet::new();
+    let mut signed_sig_fields: HashSet<ObjRef> = HashSet::new();
+    let mut unsigned_sig_objects: HashSet<ObjRef> = HashSet::new();
+    for f in sig_fields(old) {
+        if let Some(v) = f.signature(old) {
+            signed_sig_fields.extend(f.r);
+            if let Some(vr) = f.dict.get(b"V").and_then(Object::as_ref) {
+                signed_sig_fields.insert(vr);
+            }
+            if let Some(refs) = v.get(b"Reference").map(|o| old.resolve(o)).and_then(|o| o.as_array().cloned()) {
+                for entry in &refs {
+                    if let Some(er) = entry.as_ref() {
+                        signed_sig_fields.insert(er);
+                    }
+                    if let Some(tr) = old.resolve(entry).as_dict().and_then(|d| d.get(b"TransformParams").and_then(Object::as_ref)) {
+                        signed_sig_fields.insert(tr);
+                    }
+                }
+            }
+            signed_sig_widgets.extend(f.widgets.iter().filter_map(|(r, _)| *r));
+        } else {
+            unsigned_sig_objects.extend(f.r);
+            unsigned_sig_objects.extend(f.widgets.iter().filter_map(|(r, _)| *r));
+        }
+    }
+    if let Some(perms_ref) = old.root().and_then(|root| old.get(root).as_dict().and_then(|c| c.get(b"Perms").and_then(Object::as_ref))) {
+        signed_sig_fields.insert(perms_ref);
+    }
+    (signed_sig_widgets, signed_sig_fields, unsigned_sig_objects)
+}
+
+/// A classified object change, distinguishing document timestamps (permitted even under DocMDP
+/// `P=1`) from other signature and document modifications.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClassifiedChange {
+    /// An RFC 3161 document timestamp change, reported as [`kind::SIGNATURE`] and permitted under
+    /// all DocMDP levels including `P=1` (ISO 32000-2 §12.8.2.2.2 / PAdES-LTA).
+    DocTimestamp,
+    /// Any other change kind.
+    Kind(&'static str),
+}
+
+impl ClassifiedChange {
+    /// The reported change kind and whether it is permitted under DocMDP level `p`.
+    fn verdict(self, p: Option<u8>) -> (&'static str, bool) {
+        match self {
+            Self::DocTimestamp => (kind::SIGNATURE, true),
+            Self::Kind(what) => {
+                let ok = matches!(
+                    (what, p),
+                    (kind::SECURITY_STORE | kind::METADATA, _)
+                        | (kind::SIGNATURE | kind::FORM_FILL, Some(2 | 3) | None)
+                        | (kind::COMMENTS, Some(3) | None)
+                );
+                (what, ok)
+            }
+        }
+    }
 }
 
 /// The page-tree nodes (`/Pages` dictionaries and indirect `/Kids` arrays) of the signed revision,
@@ -287,6 +246,155 @@ fn signed_page_tree(old: &Document, pages: &HashSet<ObjRef>) -> HashSet<ObjRef> 
         }
     }
     tree
+}
+
+/// Context for classifying individual object changes between the signed revision `old` and `doc`.
+struct ChangedObjectClassifier<'a> {
+    doc: &'a Document,
+    old: &'a Document,
+    old_content: &'a HashSet<ObjRef>,
+    old_metadata: Option<ObjRef>,
+    old_acroform: Option<ObjRef>,
+    old_xfa_data: &'a HashSet<ObjRef>,
+    signed_pages: &'a HashSet<ObjRef>,
+    signed_page_tree: &'a HashSet<ObjRef>,
+    signed_annots: &'a HashSet<ObjRef>,
+    signed_sig_widgets: &'a HashSet<ObjRef>,
+    signed_sig_fields: &'a HashSet<ObjRef>,
+    unsigned_sig_objects: &'a HashSet<ObjRef>,
+    signed_resources: &'a HashMap<ObjRef, bool>,
+    old_info: Option<ObjRef>,
+    dss: &'a HashSet<u32>,
+}
+
+impl ChangedObjectClassifier<'_> {
+    /// Classify a modified or added object `r` by the role it held in the signed revision.
+    fn classify(&self, r: ObjRef, new: &Object, before: Option<&Object>) -> Option<ClassifiedChange> {
+        if let Some(kind) = self.resource_kind(r, new, before) {
+            return Some(ClassifiedChange::Kind(kind));
+        }
+        if self.dss.contains(&r.num) {
+            return Some(ClassifiedChange::Kind(kind::SECURITY_STORE));
+        }
+        if self.signed_page_tree.contains(&r) {
+            return Some(ClassifiedChange::Kind(kind::PAGES));
+        }
+        if self.signed_sig_widgets.contains(&r) {
+            return Some(ClassifiedChange::Kind(kind::PAGE_CONTENT));
+        }
+        if self.signed_sig_fields.contains(&r) {
+            return Some(ClassifiedChange::Kind(kind::OTHER));
+        }
+        match new {
+            Object::Dict(dict) if Some(r) == self.old.root() => Some(catalog_change_kind(self.doc, self.old, dict, before.and_then(Object::as_dict))),
+            _ if Some(r) == self.old.root() => Some(ClassifiedChange::Kind(kind::STRUCTURE)),
+            Object::Dict(dict) if self.signed_pages.contains(&r) => {
+                Some(page_change_kind(self.doc, self.old, dict, before.and_then(Object::as_dict)))
+            }
+            _ if self.signed_pages.contains(&r) => Some(ClassifiedChange::Kind(kind::PAGE_CONTENT)),
+            Object::Array(now) if self.is_signed_annotation_array(r, before) => Some(self.annotation_array_change(now, before)),
+            Object::Dict(dict) => Some(self.dictionary_change(r, dict, before)),
+            Object::Stream(stream) => self.stream_change(r, stream, before).map(ClassifiedChange::Kind),
+            _ if before.is_none() => None,
+            _ => Some(ClassifiedChange::Kind(kind::OTHER)),
+        }
+    }
+
+    /// Classify changes to an object that was a page resource in the signed revision.
+    fn resource_kind(&self, r: ObjRef, new: &Object, before: Option<&Object>) -> Option<&'static str> {
+        match (self.signed_resources.get(&r), new) {
+            (Some(false), _) => Some(kind::PAGE_CONTENT),
+            (Some(true), Object::Dict(dict)) if self.keeps_previous_entries(dict, before) => None,
+            (Some(true), _) => Some(kind::PAGE_CONTENT),
+            (None, _) => None,
+        }
+    }
+
+    /// Whether `dict` preserves every key-value entry that `before` had.
+    fn keeps_previous_entries(&self, dict: &Dict, before: Option<&Object>) -> bool {
+        before.and_then(Object::as_dict).is_some_and(|previous| previous.iter().all(|(key, value)| dict.get(key) == Some(value)))
+    }
+
+    /// Whether `r` was an indirect `/Annots` array of a signed page.
+    fn is_signed_annotation_array(&self, r: ObjRef, before: Option<&Object>) -> bool {
+        self.signed_annots.contains(&r) && before.is_some_and(|object| object.as_array().is_some())
+    }
+
+    /// Classify additions or removals on a signed page's indirect `/Annots` array.
+    fn annotation_array_change(&self, now: &[Object], before: Option<&Object>) -> ClassifiedChange {
+        let was: HashSet<ObjRef> =
+            before.and_then(Object::as_array).map(|items| items.iter().filter_map(Object::as_ref).collect()).unwrap_or_default();
+        let kept: HashSet<ObjRef> = now.iter().filter_map(Object::as_ref).collect();
+        let removed: Vec<ObjRef> = was.iter().filter(|reference| !kept.contains(reference)).copied().collect();
+        if removed.is_empty() {
+            let added: Vec<ObjRef> = now.iter().filter_map(Object::as_ref).filter(|reference| !was.contains(reference)).collect();
+            added_annots(self.doc, &added)
+        } else if removed.iter().any(|reference| self.old.get(*reference).as_dict().is_some_and(|dict| dict.name(b"Subtype") == Some(b"Widget"))) {
+            // A form field or signature widget taken off the page: no permission covers it.
+            ClassifiedChange::Kind(kind::OTHER)
+        } else {
+            // Deleting comments is a comment change (permitted at P 3 only).
+            ClassifiedChange::Kind(kind::COMMENTS)
+        }
+    }
+
+    /// Classify a changed or newly added dictionary object.
+    fn dictionary_change(&self, r: ObjRef, dict: &Dict, before: Option<&Object>) -> ClassifiedChange {
+        let previous = before.and_then(Object::as_dict);
+        if previous.is_some() && Some(r) == self.old_acroform {
+            acroform_kind(self.doc, self.old, dict, previous)
+        } else if previous.is_some() && Some(r) == self.old_info {
+            // Only the signed revision's own /Info dictionary is a metadata change.
+            ClassifiedChange::Kind(kind::METADATA)
+        } else {
+            change_kind(self.doc, self.old, dict, previous, self.unsigned_sig_objects.contains(&r))
+        }
+    }
+
+    /// Classify a changed or newly added stream object.
+    fn stream_change(&self, r: ObjRef, stream: &pdfcraft_cos::Stream, before: Option<&Object>) -> Option<&'static str> {
+        // File plumbing is the stream's role when signed; a later /Type label cannot change it.
+        let was_plumbing = matches!(before, Some(Object::Stream(previous)) if matches!(previous.dict.name(b"Type"), Some(b"XRef" | b"ObjStm")));
+        if self.old_content.contains(&r) {
+            Some(kind::PAGE_CONTENT)
+        } else if before.is_none() || was_plumbing {
+            None
+        } else if stream.dict.name(b"Type") == Some(b"Metadata") && Some(r) == self.old_metadata {
+            // Only the signed catalog's XMP stream is metadata.
+            Some(kind::METADATA)
+        } else if self.old_xfa_data.contains(&r) {
+            // Signed XFA data and state packets are changed by a form fill.
+            Some(kind::FORM_FILL)
+        } else {
+            Some(kind::OTHER)
+        }
+    }
+
+    /// Classify an object `num` that existed in the signed revision and was freed in a later one.
+    fn classify_freed(&self, num: u32) -> Option<&'static str> {
+        let r = ObjRef { num, generation: self.old.generation(num) };
+        let was = self.old.get(r);
+        let page_role = self.old_content.contains(&r)
+            || self.signed_pages.contains(&r)
+            || self.signed_resources.contains_key(&r)
+            || self.signed_sig_widgets.contains(&r);
+        let struct_role = Some(r) == self.old.root();
+        let pages_role = self.signed_page_tree.contains(&r);
+        let signed_role = page_role || struct_role || pages_role;
+        // A signed page's content or resource is judged by that role, whatever /Type its stream carried.
+        if !signed_role && matches!(&*was, Object::Stream(s) if matches!(s.dict.name(b"Type"), Some(b"XRef" | b"ObjStm"))) {
+            return None;
+        }
+        Some(if struct_role {
+            kind::STRUCTURE
+        } else if pages_role {
+            kind::PAGES
+        } else if page_role {
+            kind::PAGE_CONTENT
+        } else {
+            kind::OTHER
+        })
+    }
 }
 
 /// The streams of `doc`'s XFA form that hold its data and state: the `datasets` and `form`
@@ -425,26 +533,52 @@ fn dss_parts(doc: &Document, old: &Document) -> HashSet<u32> {
     parts
 }
 
+/// Whether `d` is a document timestamp dictionary (`/SubFilter /ETSI.RFC3161` with `/ByteRange`
+/// and `/Contents`).
+fn is_doc_timestamp_dict(d: &Dict) -> bool {
+    super::validate::is_doc_timestamp(d) && d.contains(b"ByteRange") && d.contains(b"Contents")
+}
+
+/// Whether a signature field or widget dictionary `d` holds a document timestamp in `/V`
+/// (directly or on its `/Parent` field).
+fn is_timestamp_field_or_widget(doc: &Document, d: &Dict) -> bool {
+    let v = d.get(b"V").cloned().or_else(|| d.get(b"Parent").map(|p| doc.resolve(p)).and_then(|p| p.as_dict().and_then(|pd| pd.get(b"V").cloned())));
+    v.is_some_and(|v| doc.resolve(&v).as_dict().is_some_and(is_doc_timestamp_dict))
+}
+
+/// Whether `doc` gained a new document timestamp dictionary compared with `old`.
+fn has_added_doc_timestamp(doc: &Document, old: &Document) -> bool {
+    doc.object_numbers().into_iter().any(|num| {
+        old.try_get(num).ok().filter(|o| !matches!(**o, Object::Null)).is_none()
+            && doc.get(ObjRef { num, generation: doc.generation(num) }).as_dict().is_some_and(is_doc_timestamp_dict)
+    })
+}
+
 /// What adding `added` annotations amounts to: signing (signature widgets only), form fill
 /// (other widgets) or comments.
-fn added_annots(doc: &Document, added: &[ObjRef]) -> &'static str {
-    let kinds: Vec<(bool, bool)> = added
+fn added_annots(doc: &Document, added: &[ObjRef]) -> ClassifiedChange {
+    let kinds: Vec<(bool, bool, bool)> = added
         .iter()
         .map(|r| {
             let o = doc.get(*r);
             let d = o.as_dict();
-            (d.is_some_and(|d| d.name(b"Subtype") == Some(b"Widget")), d.is_some_and(|d| d.name(b"FT") == Some(b"Sig")))
+            (
+                d.is_some_and(|d| d.name(b"Subtype") == Some(b"Widget")),
+                d.is_some_and(|d| d.name(b"FT") == Some(b"Sig")),
+                d.is_some_and(|d| is_timestamp_field_or_widget(doc, d)),
+            )
         })
         .collect();
-    if !kinds.is_empty() && kinds.iter().all(|(w, s)| *w && *s) {
-        kind::SIGNATURE
-    } else if !kinds.is_empty() && kinds.iter().all(|(w, _)| *w) {
-        kind::FORM_FILL
+    if !kinds.is_empty() && kinds.iter().all(|(w, s, _)| *w && *s) {
+        if kinds.iter().all(|(_, _, ts)| *ts) { ClassifiedChange::DocTimestamp } else { ClassifiedChange::Kind(kind::SIGNATURE) }
+    } else if !kinds.is_empty() && kinds.iter().all(|(w, _, _)| *w) {
+        ClassifiedChange::Kind(kind::FORM_FILL)
     } else {
-        kind::COMMENTS
+        ClassifiedChange::Kind(kind::COMMENTS)
     }
 }
 
+/// Object references in an indirect or direct array `o`.
 fn refs(doc: &Document, o: Option<&Object>) -> Vec<ObjRef> {
     o.map(|o| doc.resolve(o)).and_then(|a| a.as_array().map(|a| a.iter().filter_map(Object::as_ref).collect())).unwrap_or_default()
 }
@@ -457,7 +591,7 @@ fn acroform(doc: &Document) -> Option<Dict> {
 
 /// An AcroForm change that only adds signature fields (and sets `/SigFlags`) is signing.
 /// Without `before`, the signed revision's AcroForm (wherever it was) is the reference.
-fn acroform_kind(doc: &Document, old: &Document, now: &Dict, before: Option<&Dict>) -> &'static str {
+fn acroform_kind(doc: &Document, old: &Document, now: &Dict, before: Option<&Dict>) -> ClassifiedChange {
     let fallback = acroform(old).unwrap_or_default();
     let before = before.unwrap_or(&fallback);
     let strip = |d: &Dict| -> Vec<(Vec<u8>, Object)> {
@@ -467,15 +601,23 @@ fn acroform_kind(doc: &Document, old: &Document, now: &Dict, before: Option<&Dic
         v
     };
     if strip(now) != strip(before) {
-        return kind::FORM_FILL;
+        return ClassifiedChange::Kind(kind::FORM_FILL);
     }
     let old_fields = refs(old, before.get(b"Fields"));
     let now_fields = refs(doc, now.get(b"Fields"));
     if old_fields.iter().any(|r| !now_fields.contains(r)) {
-        return kind::OTHER;
+        return ClassifiedChange::Kind(kind::OTHER);
     }
     let added: Vec<ObjRef> = now_fields.into_iter().filter(|r| !old_fields.contains(r)).collect();
-    if added.is_empty() || added_annots(doc, &added) == kind::SIGNATURE { kind::SIGNATURE } else { kind::FORM_FILL }
+    if added.is_empty() {
+        if has_added_doc_timestamp(doc, old) { ClassifiedChange::DocTimestamp } else { ClassifiedChange::Kind(kind::SIGNATURE) }
+    } else {
+        match added_annots(doc, &added) {
+            ClassifiedChange::DocTimestamp => ClassifiedChange::DocTimestamp,
+            ClassifiedChange::Kind(kind::SIGNATURE) => ClassifiedChange::Kind(kind::SIGNATURE),
+            _ => ClassifiedChange::Kind(kind::FORM_FILL),
+        }
+    }
 }
 
 /// Dictionary entries in a stable order, without `keys`.
@@ -583,36 +725,38 @@ fn signed_page_resources(old: &Document, pages: &HashSet<ObjRef>) -> HashMap<Obj
 
 /// A changed object that was the catalog in the signed revision, judged by its role as the
 /// catalog whatever `/Type` its new version carries.
-fn catalog_change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> &'static str {
+fn catalog_change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> ClassifiedChange {
     // /NeedsRendering selects dynamic XFA rendering. A change of it is structure, not metadata.
     let keys: &[&[u8]] = &[b"AcroForm", b"DSS", b"Perms", b"Metadata", b"Extensions"];
     match before {
-        Some(b) if without(d, keys) != without(b, keys) => kind::STRUCTURE,
+        Some(b) if without(d, keys) != without(b, keys) => ClassifiedChange::Kind(kind::STRUCTURE),
         // Developer extensions (ISO 32000-2 §7.12) only declare what the file uses. A
         // writer adding a /DSS also declares the ESIC extension it belongs to, so a
         // declaration may be added, but none that was signed may change or go.
-        Some(b) if !extensions_kept(doc, old, d, b) => kind::STRUCTURE,
+        Some(b) if !extensions_kept(doc, old, d, b) => ClassifiedChange::Kind(kind::STRUCTURE),
+        // Removing or replacing a `/Perms` dictionary that was already signed is never permitted.
+        Some(b) if b.contains(b"Perms") && b.get(b"Perms") != d.get(b"Perms") => ClassifiedChange::Kind(kind::STRUCTURE),
         Some(b) => {
             if d.get(b"AcroForm") != b.get(b"AcroForm") {
                 // Compare the forms themselves, inline or not.
                 let now = acroform(doc).unwrap_or_default();
                 acroform_kind(doc, old, &now, None)
             } else if b.get(b"Perms") != d.get(b"Perms") {
-                kind::SIGNATURE
+                ClassifiedChange::Kind(kind::SIGNATURE)
             } else {
-                kind::METADATA
+                ClassifiedChange::Kind(kind::METADATA)
             }
         }
-        None => kind::STRUCTURE,
+        None => ClassifiedChange::Kind(kind::STRUCTURE),
     }
 }
 
 /// A changed object that was a page in the signed revision, judged by what the page shows rather
 /// than by any `/Type` its new version carries. Only added annotations are permitted; any other
 /// difference (content, resources, a relabelled or dropped `/Type`) is a page content change.
-fn page_change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> &'static str {
+fn page_change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> ClassifiedChange {
     match before {
-        Some(b) if without(d, &[b"Annots"]) != without(b, &[b"Annots"]) => kind::PAGE_CONTENT,
+        Some(b) if without(d, &[b"Annots"]) != without(b, &[b"Annots"]) => ClassifiedChange::Kind(kind::PAGE_CONTENT),
         Some(b) => {
             let was = refs(old, b.get(b"Annots"));
             let now = refs(doc, d.get(b"Annots"));
@@ -621,12 +765,12 @@ fn page_change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Di
                 let added: Vec<ObjRef> = now.into_iter().filter(|r| !was.contains(r)).collect();
                 added_annots(doc, &added)
             } else if removed.iter().any(|r| old.get(*r).as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Widget"))) {
-                kind::OTHER
+                ClassifiedChange::Kind(kind::OTHER)
             } else {
-                kind::COMMENTS
+                ClassifiedChange::Kind(kind::COMMENTS)
             }
         }
-        None => kind::PAGE_CONTENT,
+        None => ClassifiedChange::Kind(kind::PAGE_CONTENT),
     }
 }
 
@@ -642,7 +786,15 @@ fn extensions_kept(doc: &Document, old: &Document, d: &Dict, b: &Dict) -> bool {
     }
 }
 
-fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>, was_unsigned_sig: bool) -> &'static str {
+/// Classify a signature field or widget dictionary `d` as either a document timestamp or a
+/// regular signature change.
+fn sig_field_change(doc: &Document, d: &Dict, before: Option<&Dict>) -> ClassifiedChange {
+    let only_filled = before.is_none_or(|b| without(d, &[b"V", b"AP", b"Ff"]) == without(b, &[b"V", b"AP", b"Ff"]));
+    if only_filled && is_timestamp_field_or_widget(doc, d) { ClassifiedChange::DocTimestamp } else { ClassifiedChange::Kind(kind::SIGNATURE) }
+}
+
+/// Classify a modified or newly added dictionary `d` against its signed version `before`.
+fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>, was_unsigned_sig: bool) -> ClassifiedChange {
     let ty = d.name(b"Type");
     // A signature widget or field that already held a signature when signed, or a signed
     // signature/timestamp/SigRef/TransformParams dictionary, must never be rewritten later.
@@ -652,13 +804,13 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>, 
             && b.get(b"V").is_some_and(|v| old.resolve(v).as_dict().is_some())
             && before != Some(d)
         {
-            return kind::PAGE_CONTENT;
+            return ClassifiedChange::Kind(kind::PAGE_CONTENT);
         }
         if is_signed_sig_value_or_ref(b) || (b.name(b"FT") == Some(b"Sig") && b.get(b"V").is_some_and(|v| old.resolve(v).as_dict().is_some())) {
-            return kind::OTHER;
+            return ClassifiedChange::Kind(kind::OTHER);
         }
         if b.name(b"Type") == Some(b"Pages") {
-            return kind::PAGES;
+            return ClassifiedChange::Kind(kind::PAGES);
         }
         if b.name(b"Type") == Some(b"Catalog") {
             return catalog_change_kind(doc, old, d, Some(b));
@@ -672,11 +824,13 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>, 
     let signature_ok = before.is_none_or(|b| was_unsigned_sig || is_unsigned_sig_dict(old, b));
     match ty {
         // Only a new signature value or policy: rewriting a signed one is not a signature (#1788).
-        Some(b"Sig" | b"DocTimeStamp" | b"SigRef" | b"TransformParams") if before.is_none() => return kind::SIGNATURE,
-        Some(b"Sig" | b"DocTimeStamp" | b"SigRef" | b"TransformParams") => return kind::OTHER,
-        Some(b"Catalog") => return if before.is_some() { catalog_change_kind(doc, old, d, before) } else { kind::STRUCTURE },
-        Some(b"Page") => return if before.is_some() { page_change_kind(doc, old, d, before) } else { kind::COMMENTS },
-        Some(b"Pages") => return if before.is_some() { kind::PAGES } else { kind::STRUCTURE },
+        Some(b"Sig" | b"DocTimeStamp" | b"SigRef" | b"TransformParams") if before.is_none() => {
+            return if is_doc_timestamp_dict(d) { ClassifiedChange::DocTimestamp } else { ClassifiedChange::Kind(kind::SIGNATURE) };
+        }
+        Some(b"Sig" | b"DocTimeStamp" | b"SigRef" | b"TransformParams") => return ClassifiedChange::Kind(kind::OTHER),
+        Some(b"Catalog") => return if before.is_some() { catalog_change_kind(doc, old, d, before) } else { ClassifiedChange::Kind(kind::STRUCTURE) },
+        Some(b"Page") => return if before.is_some() { page_change_kind(doc, old, d, before) } else { ClassifiedChange::Kind(kind::COMMENTS) },
+        Some(b"Pages") => return ClassifiedChange::Kind(if before.is_some() { kind::PAGES } else { kind::STRUCTURE }),
         _ => {}
     }
     if let Some(b) = before {
@@ -684,20 +838,24 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>, 
         // dropping `/Type` or adding `/FT`, `/Subtype`, `/Fields`, or `/DR` later cannot turn
         // an arbitrary signed dictionary into a form fill or comment annotation.
         if b.name(b"Type").is_some() && d.name(b"Type") != b.name(b"Type") {
-            return kind::OTHER;
+            return ClassifiedChange::Kind(kind::OTHER);
         }
         match b.name(b"Subtype") {
             Some(b"Widget") if d.name(b"Subtype") == Some(b"Widget") => {
-                return if d.name(b"FT") == Some(b"Sig") && signature_ok { kind::SIGNATURE } else { kind::FORM_FILL };
+                return if d.name(b"FT") == Some(b"Sig") && signature_ok {
+                    sig_field_change(doc, d, before)
+                } else {
+                    ClassifiedChange::Kind(kind::FORM_FILL)
+                };
             }
-            Some(b"Link") if d.name(b"Subtype") == Some(b"Link") => return kind::LINKS,
+            Some(b"Link") if d.name(b"Subtype") == Some(b"Link") => return ClassifiedChange::Kind(kind::LINKS),
             Some(st) if d.name(b"Subtype") == Some(st) && (b.name(b"Type") == Some(b"Annot") || b.contains(b"Rect")) => {
-                return kind::COMMENTS;
+                return ClassifiedChange::Kind(kind::COMMENTS);
             }
             _ => {}
         }
         if d.name(b"FT") == Some(b"Sig") && signature_ok {
-            return kind::SIGNATURE;
+            return sig_field_change(doc, d, before);
         }
         if b.contains(b"Fields") && d.contains(b"Fields") {
             return acroform_kind(doc, old, d, Some(b));
@@ -706,24 +864,30 @@ fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>, 
             || (b.contains(b"T") && b.contains(b"Kids") && d.contains(b"T") && d.contains(b"Kids"))
             || (b.contains(b"DR") && d.contains(b"DR"))
         {
-            return kind::FORM_FILL;
+            return ClassifiedChange::Kind(kind::FORM_FILL);
         }
-        return kind::OTHER;
+        return ClassifiedChange::Kind(kind::OTHER);
     }
     match d.name(b"Subtype") {
-        Some(b"Widget") => return if d.name(b"FT") == Some(b"Sig") && signature_ok { kind::SIGNATURE } else { kind::FORM_FILL },
-        Some(b"Link") => return kind::LINKS,
-        Some(_) if ty == Some(b"Annot") || d.contains(b"Rect") => return kind::COMMENTS,
+        Some(b"Widget") => {
+            return if d.name(b"FT") == Some(b"Sig") && signature_ok {
+                sig_field_change(doc, d, None)
+            } else {
+                ClassifiedChange::Kind(kind::FORM_FILL)
+            };
+        }
+        Some(b"Link") => return ClassifiedChange::Kind(kind::LINKS),
+        Some(_) if ty == Some(b"Annot") || d.contains(b"Rect") => return ClassifiedChange::Kind(kind::COMMENTS),
         _ => {}
     }
     if d.name(b"FT") == Some(b"Sig") && signature_ok {
-        return kind::SIGNATURE;
+        return sig_field_change(doc, d, None);
     }
     if d.contains(b"Fields") {
         return acroform_kind(doc, old, d, before);
     }
     if d.contains(b"FT") || (d.contains(b"T") && d.contains(b"Kids")) || d.contains(b"DR") {
-        return kind::FORM_FILL;
+        return ClassifiedChange::Kind(kind::FORM_FILL);
     }
-    kind::FORM_FILL
+    ClassifiedChange::Kind(kind::FORM_FILL)
 }

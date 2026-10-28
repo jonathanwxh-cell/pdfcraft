@@ -1,6 +1,9 @@
 use super::look::redraw_field;
 use super::tree::{add_to_page, attach, clash, ensure_form, free_name, name_parts, top_names};
-use super::*;
+use super::{
+    Dict, Document, Field, FieldKind, FormError, MIN_FIELD_SIDE, NewField, ObjRef, Object, PdfString, Widget, appearance, fields, flags, invalid,
+    page_refs, rgb,
+};
 
 fn widget_dict(page: ObjRef, rect: [f64; 4]) -> Dict {
     let mut d = Dict::new();
@@ -562,6 +565,73 @@ fn prune_empty_struct_k(
     }
 }
 
+fn prune_hit_elements(
+    doc: &mut Document,
+    elem_hits: Vec<ObjRef>,
+    all_gone: &std::collections::HashSet<ObjRef>,
+    mut parents: std::collections::HashMap<ObjRef, Vec<ObjRef>>,
+    cleanup_budget: &mut usize,
+) -> Result<std::collections::HashSet<ObjRef>, FormError> {
+    let mut emptied_elems = std::collections::HashSet::new();
+    for r in elem_hits {
+        let Some(d) = doc.get(r).as_dict().cloned() else { continue };
+        let kids = d.get(b"K").map(|k| doc.resolve(k));
+        let array = kids.as_ref().is_some_and(|k| matches!(&**k, Object::Array(_)));
+        let list: Vec<Object> = match kids.as_deref() {
+            Some(Object::Array(a)) => a.clone(),
+            Some(_) => d.get(b"K").cloned().into_iter().collect(),
+            None => Vec::new(),
+        };
+        let mut keep = Vec::new();
+        for child in list {
+            if let Some(child) = prune_empty_struct_k(doc, &child, all_gone, 0, cleanup_budget)? {
+                keep.push(child);
+            }
+        }
+        if keep.is_empty() {
+            emptied_elems.insert(r);
+        }
+        doc.update_dict(r, |e| {
+            if array && !keep.is_empty() {
+                e.set(b"K".to_vec(), Object::Array(keep.clone()));
+            } else if let Some(k) = keep.first().cloned() {
+                e.set(b"K".to_vec(), k);
+            } else {
+                e.remove(b"K");
+            }
+            if keep.is_empty() {
+                for key in [&b"Alt"[..], b"ActualText", b"T", b"E", b"ID", b"A"] {
+                    e.remove(key);
+                }
+            }
+        })?;
+    }
+    let mut pending: Vec<ObjRef> = emptied_elems.iter().copied().collect();
+    while let Some(empty) = pending.pop() {
+        for parent in parents.remove(&empty).unwrap_or_default() {
+            if emptied_elems.contains(&parent) {
+                continue;
+            }
+            let Some(k) = doc.get(parent).as_dict().and_then(|d| d.get(b"K").cloned()) else { continue };
+            let kept = prune_empty_struct_k(doc, &k, &emptied_elems, 0, cleanup_budget)?;
+            if kept.is_none() && emptied_elems.insert(parent) {
+                pending.push(parent);
+            }
+            doc.update_dict(parent, |d| {
+                if let Some(k) = kept.clone() {
+                    d.set(b"K".to_vec(), k);
+                } else {
+                    d.remove(b"K");
+                    for key in [&b"Alt"[..], b"ActualText", b"T", b"E", b"ID", b"A"] {
+                        d.remove(key);
+                    }
+                }
+            })?;
+        }
+    }
+    Ok(emptied_elems)
+}
+
 fn drop_struct_tree_refs(doc: &mut Document, gone: &std::collections::HashSet<ObjRef>) -> Result<(), FormError> {
     if gone.is_empty() {
         return Ok(());
@@ -663,63 +733,7 @@ fn drop_struct_tree_refs(doc: &mut Document, gone: &std::collections::HashSet<Ob
             _ => {}
         }
     }
-    let mut emptied_elems = std::collections::HashSet::new();
-    for r in elem_hits {
-        let Some(d) = doc.get(r).as_dict().cloned() else { continue };
-        let kids = d.get(b"K").map(|k| doc.resolve(k));
-        let array = kids.as_ref().is_some_and(|k| matches!(&**k, Object::Array(_)));
-        let list: Vec<Object> = match kids.as_deref() {
-            Some(Object::Array(a)) => a.clone(),
-            Some(_) => d.get(b"K").cloned().into_iter().collect(),
-            None => Vec::new(),
-        };
-        let mut keep = Vec::new();
-        for child in list {
-            if let Some(child) = prune_empty_struct_k(doc, &child, &all_gone, 0, &mut cleanup_budget)? {
-                keep.push(child);
-            }
-        }
-        if keep.is_empty() {
-            emptied_elems.insert(r);
-        }
-        doc.update_dict(r, |e| {
-            if array && !keep.is_empty() {
-                e.set(b"K".to_vec(), Object::Array(keep.clone()));
-            } else if let Some(k) = keep.first().cloned() {
-                e.set(b"K".to_vec(), k);
-            } else {
-                e.remove(b"K");
-            }
-            if keep.is_empty() {
-                for key in [&b"Alt"[..], b"ActualText", b"T", b"E", b"ID", b"A"] {
-                    e.remove(key);
-                }
-            }
-        })?;
-    }
-    let mut pending: Vec<ObjRef> = emptied_elems.iter().copied().collect();
-    while let Some(empty) = pending.pop() {
-        for parent in parents.remove(&empty).unwrap_or_default() {
-            if emptied_elems.contains(&parent) {
-                continue;
-            }
-            let Some(k) = doc.get(parent).as_dict().and_then(|d| d.get(b"K").cloned()) else { continue };
-            let kept = prune_empty_struct_k(doc, &k, &emptied_elems, 0, &mut cleanup_budget)?;
-            if kept.is_none() && emptied_elems.insert(parent) {
-                pending.push(parent);
-            }
-            doc.update_dict(parent, |d| {
-                if let Some(k) = kept.clone() {
-                    d.set(b"K".to_vec(), k);
-                } else {
-                    d.remove(b"K");
-                    for key in [&b"Alt"[..], b"ActualText", b"T", b"E", b"ID", b"A"] {
-                        d.remove(key);
-                    }
-                }
-            })?;
-        }
-    }
+    let emptied_elems = prune_hit_elements(doc, elem_hits, &all_gone, parents, &mut cleanup_budget)?;
     all_gone.extend(emptied_elems.iter().copied());
     let mut changed_nodes = std::collections::HashSet::new();
     for r in tree_nodes.into_iter().rev() {

@@ -1,5 +1,5 @@
 use super::geometry::{corner_ratio, is_markup, resized};
-use super::*;
+use super::{Annotation, CommentPrefs, CommentTool, DocInfo, Edit, PagePointer, PageXform, Pos2, QuickTool, Rect};
 
 /// The user's login name, which Acrobat uses as the default comment author.
 pub(super) fn login_name() -> String {
@@ -202,17 +202,19 @@ impl CommentView {
 
     /// Captures `(page, index)` comment slot identity for every comment in `info`.
     fn snapshot_slots(info: &DocInfo) -> std::collections::HashMap<(usize, usize), CommentSlot> {
-        let mut counts = std::collections::HashMap::<usize, usize>::new();
+        let mut by_page = std::collections::HashMap::<usize, Vec<usize>>::new();
         for a in &info.annotations {
-            *counts.entry(a.page).or_default() += 1;
+            by_page.entry(a.page).or_default().push(a.index);
         }
-        let mut ords = std::collections::HashMap::<usize, usize>::new();
+        for indices in by_page.values_mut() {
+            indices.sort_unstable();
+            indices.dedup();
+        }
         let mut slots = std::collections::HashMap::with_capacity(info.annotations.len());
         for a in &info.annotations {
-            let ord = ords.entry(a.page).or_default();
-            let page_ord = *ord;
-            *ord += 1;
-            let page_count = counts.get(&a.page).copied().unwrap_or(0);
+            let indices = by_page.get(&a.page).map(Vec::as_slice).unwrap_or_default();
+            let page_ord = indices.binary_search(&a.index).unwrap_or(0);
+            let page_count = indices.len();
             slots.insert((a.page, a.index), CommentSlot { subtype: a.subtype.clone(), name: a.name.clone(), page_ord, page_count });
         }
         slots

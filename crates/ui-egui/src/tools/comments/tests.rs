@@ -511,3 +511,50 @@ fn an_unnamed_shift_clears_state_for_the_old_index() {
     assert_eq!(view.comments.composer, None);
     assert_eq!(view.comments.gesture, None);
 }
+
+#[test]
+fn spatial_reordering_preserves_comment_state() {
+    let annot = |index: usize, name: &str| Annotation {
+        page: 0,
+        index,
+        subtype: "Text".into(),
+        rect: [10.0, 10.0, 30.0, 30.0],
+        color: None,
+        author: None,
+        contents: Some(name.into()),
+        modified: None,
+        in_reply_to: None,
+        parent: None,
+        grouped: false,
+        name: Some(name.into()),
+        state: None,
+        quads: Vec::new(),
+        locked: false,
+        intent: None,
+        fill_sign: false,
+        no_rotate: false,
+        points: Vec::new(),
+    };
+    // Page 0 has a Widget at index 0 (not in `info.annotations`), and Text comments at 1 and 2.
+    let info = DocInfo {
+        pages: vec![PageInfo { width: 300.0, height: 400.0, label: String::new(), crop: [0.0, 0.0, 300.0, 400.0], rotation: 0 }],
+        annotations: vec![annot(1, "c1"), annot(2, "c2")],
+        ..Default::default()
+    };
+    let mut view = DocView::new(pdfcraft_engine::DocId(1), &info, crate::canvas::ViewDefaults::default());
+    view.comments.selected = Some((0, 2));
+    view.comments.open_editor(0, 2, "draft".into());
+    view.comments.composer = Some(Composer { page: 0, at: [10.0, 10.0], kind: ComposerKind::Edit(2), text: "body".into(), focus: false });
+    view.comments.gesture = Some(Gesture::Move { page: 0, index: 2, from: pos2(0.0, 0.0) });
+
+    // Inspection is spatially sorted: moving a comment past its neighbour must not
+    // change its /Annots identity or discard an unsaved editor.
+    let mut moved = info.clone();
+    moved.annotations.reverse();
+    view.document_changed(&moved);
+    assert_eq!(view.comments.selected, Some((0, 2)));
+    assert_eq!(view.comments.editing.as_ref().map(|(_, _, text)| text.as_str()), Some("draft"));
+    assert!(view.comments.composer.is_some());
+    assert!(view.comments.gesture.is_some());
+
+}

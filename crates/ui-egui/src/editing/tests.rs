@@ -377,3 +377,61 @@ fn save_asks_where_to_keep_an_email_attachment_and_leaves_the_temporary_copy_alo
     assert!(app.save_active(SaveTarget::InPlace));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn page_insertions_and_deletions_cancel_only_retargeted_comment_drafts() {
+    use crate::comments::{CommentTool, Composer, ComposerKind, Gesture};
+    use pdfcraft_engine::Edit;
+    let cases = [
+        (Edit::InsertBlankPage { at: 0, width: 200.0, height: 300.0 }, false),
+        (Edit::InsertBlankPage { at: 1, width: 200.0, height: 300.0 }, false),
+        (Edit::InsertBlankPage { at: 2, width: 200.0, height: 300.0 }, true),
+        (Edit::DeletePages { pages: vec![0] }, false),
+        (Edit::DeletePages { pages: vec![1] }, false),
+        (Edit::DeletePages { pages: vec![2] }, true),
+        (Edit::DuplicatePages { pages: vec![0], at: None }, false),
+        (Edit::DuplicatePages { pages: vec![0], at: Some(2) }, true),
+        (Edit::MovePages { pages: vec![2], to: 0 }, false),
+        (Edit::ReversePages { pages: vec![0, 1] }, false),
+        (Edit::ReversePages { pages: vec![0, 1, 2] }, true),
+        (Edit::MovePages { pages: vec![2], to: 2 }, true),
+        (Edit::MovePages { pages: vec![0], to: 0 }, true),
+        (
+            Edit::InsertPagesFrom {
+                name: "insert.pdf".into(),
+                bytes: std::sync::Arc::new(one_page_pdf()),
+                pages: None,
+                at: 0,
+                field_conflicts: Default::default(),
+            },
+            false,
+        ),
+        (
+            Edit::InsertPagesFrom {
+                name: "append.pdf".into(),
+                bytes: std::sync::Arc::new(one_page_pdf()),
+                pages: None,
+                at: 3,
+                field_conflicts: Default::default(),
+            },
+            true,
+        ),
+    ];
+    for (edit, preserved) in cases {
+        let mut app = crate::PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("drafts.pdf", None, one_page_pdf()).unwrap();
+        for at in [1, 2] {
+            assert!(app.apply_edit(Edit::InsertBlankPage { at, width: 200.0, height: 300.0 }));
+        }
+        let comments = &mut app.views[0].comments;
+        comments.gesture = Some(Gesture::Draw { page: 1, tool: CommentTool::Ink, points: vec![[10.0, 10.0]] });
+        comments.composer = Some(Composer { page: 1, at: [10.0, 10.0], kind: ComposerKind::Note, text: "unsaved".into(), focus: false });
+        assert!(!app.apply_edit(Edit::DeletePages { pages: vec![99] }));
+        assert!(app.views[0].comments.gesture.is_some(), "failed edits keep drafts");
+        assert!(app.views[0].comments.composer.is_some(), "failed edits keep drafts");
+        assert!(app.apply_edit(edit.clone()), "{edit:?}");
+        assert_eq!(app.views[0].comments.gesture.is_some(), preserved, "drawing: {edit:?}");
+        assert_eq!(app.views[0].comments.composer.is_some(), preserved, "composer: {edit:?}");
+    }
+}

@@ -4,7 +4,7 @@ use super::passwords::password_data_wants;
 use super::path::parse_datasets_complete;
 use super::values::Want;
 use super::write::{DatasetsWrite, rewrite};
-use super::*;
+use super::{DataPath, Document, MAX_DEPTH, MAX_NODES, ObjRef, Object, XFA_DATA_NS, XfaError};
 
 /// Data read from a file, held as a tree so it can be written into any packet with the
 /// prefix that packet uses, never as the file's own markup.

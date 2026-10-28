@@ -1,4 +1,4 @@
-use super::{DataNode, DataPath, Field, MAX_DEPTH, MAX_NODES, Node, SomIndices, Template};
+use super::{DataNode, DataPath, Field, MAX_DEPTH, MAX_NODES, MAX_SOM_INDEX, Node, SomIndices, Template};
 
 fn to_node(n: roxmltree::Node, depth: usize, complete: &mut bool) -> DataNode {
     let name = n.tag_name().name().to_string();

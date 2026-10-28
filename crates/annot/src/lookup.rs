@@ -1,4 +1,4 @@
-use super::info::text_value;
+use super::info::{is_comment_subtype, text_value};
 use super::types::{FLAG_HIDDEN, FLAG_NO_ROTATE, FLAG_NO_VIEW, Shape};
 use super::{AnnotError, Dict, Document, ObjRef, Object, appearance};
 

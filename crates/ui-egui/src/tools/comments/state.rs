@@ -202,20 +202,69 @@ impl CommentView {
 
     /// Captures `(page, index)` comment slot identity for every comment in `info`.
     fn snapshot_slots(info: &DocInfo) -> std::collections::HashMap<(usize, usize), CommentSlot> {
-        let mut counts = std::collections::HashMap::<usize, usize>::new();
+        let mut by_page = std::collections::HashMap::<usize, Vec<usize>>::new();
         for a in &info.annotations {
-            *counts.entry(a.page).or_default() += 1;
+            by_page.entry(a.page).or_default().push(a.index);
         }
-        let mut ords = std::collections::HashMap::<usize, usize>::new();
+        for indices in by_page.values_mut() {
+            indices.sort_unstable();
+        }
         let mut slots = std::collections::HashMap::with_capacity(info.annotations.len());
         for a in &info.annotations {
-            let ord = ords.entry(a.page).or_default();
-            let page_ord = *ord;
-            *ord += 1;
-            let page_count = counts.get(&a.page).copied().unwrap_or(0);
+            let Some(indices) = by_page.get(&a.page) else { continue };
+            let Ok(page_ord) = indices.binary_search(&a.index) else { continue };
+            let page_count = indices.len();
             slots.insert((a.page, a.index), CommentSlot { subtype: a.subtype.clone(), name: a.name.clone(), page_ord, page_count });
         }
         slots
+    }
+
+    /// A successful page-list edit can retarget an in-range page index. Cancel drafts
+    /// on affected pages before adopting the new inspection; appending after a draft
+    /// leaves its original page alone. Failed edits never call this method.
+    pub(crate) fn page_edit_applied(&mut self, edit: &pdfcraft_engine::Edit, before: usize, after: usize) {
+        use pdfcraft_engine::Edit;
+        let ordered = match edit {
+            Edit::MovePages { pages, .. } | Edit::ReversePages { pages } => pages.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            _ => Default::default(),
+        };
+        let affected = |page: usize| match edit {
+            Edit::InsertBlankPage { at, .. } | Edit::InsertPagesFrom { at, .. } => after > before && page >= (*at).min(before),
+            Edit::DuplicatePages { pages, at } => {
+                let at = at.or_else(|| pages.iter().max().map(|p| p.saturating_add(1)));
+                after > before && at.is_some_and(|at| page >= at.min(before))
+            }
+            Edit::DeletePages { pages } => pages.iter().any(|removed| *removed <= page),
+            Edit::MovePages { to, .. } => {
+                let at = (*to).min(before.saturating_sub(ordered.len()));
+                let preceding = ordered.range(..page).count();
+                let destination = if ordered.contains(&page) {
+                    at.saturating_add(preceding)
+                } else {
+                    let remaining = page.saturating_sub(preceding);
+                    if remaining >= at { remaining.saturating_add(ordered.len()) } else { remaining }
+                };
+                destination != page
+            }
+            Edit::ReversePages { .. } => ordered.iter().zip(ordered.iter().rev()).any(|(old, new)| *old == page && old != new),
+            _ => false,
+        };
+        if self.selected.is_some_and(|(page, _)| affected(page)) {
+            self.selected = None;
+        }
+        if self.editing.as_ref().is_some_and(|(page, _, _)| affected(*page)) {
+            self.editing = None;
+            self.editor_focus = None;
+        }
+        if self.composer.as_ref().is_some_and(|c| affected(c.page)) {
+            self.composer = None;
+            self.replace = None;
+        }
+        if self.gesture.as_ref().is_some_and(|g| match g {
+            Gesture::Draw { page, .. } | Gesture::Move { page, .. } | Gesture::Resize { page, .. } | Gesture::Reshape { page, .. } => affected(*page),
+        }) {
+            self.gesture = None;
+        }
     }
 
     /// Prunes comment state whose `(page, index)` slot was removed or shifted by a document change.

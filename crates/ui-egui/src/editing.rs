@@ -56,6 +56,7 @@ impl PdfCraftApp {
                     // Only a new drawing waits on its raster; any other edit may remove or move it.
                     view.comments.settling.clear();
                 }
+                view.comments.page_edit_applied(&edit, page_count_before, info.pages.len());
                 view.signature_drag.committed(&edit, doc.edit_generation());
                 view.move_background.committed(&edit, doc.edit_generation());
                 view.text_background.committed(&edit);
@@ -125,11 +126,6 @@ impl PdfCraftApp {
                 // Keep the pages the user acted on selected, where they now are.
                 match edit {
                     Edit::MovePages { pages, to } => {
-                        // A drawing stores a page index and no comment slot. Reordering keeps
-                        // the page count, so the drawing would land on a different page.
-                        if matches!(view.comments.gesture, Some(crate::comments::Gesture::Draw { .. })) {
-                            view.comments.gesture = None;
-                        }
                         let n = pages.iter().collect::<std::collections::BTreeSet<_>>().len();
                         let to = to.min(info.pages.len() - n);
                         view.select_pages(&(to..to + n).collect::<Vec<_>>());

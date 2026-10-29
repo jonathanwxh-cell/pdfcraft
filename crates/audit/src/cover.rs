@@ -4,7 +4,7 @@
 //! color (`re` + `f`) is the classic way a "redaction" is faked. A single closed `m`/`l` subpath
 //! whose four corners form an axis-aligned rectangle in user space is the same shape and counts
 //! too (#1510). Graphics state tracked here is deliberately small: the CTM stack (`q`/`Q`/`cm`),
-//! the non-stroking color (`g`/`rg`/`k`) and the non-stroking alpha from ExtGState (`gs` reading
+//! the non-stroking color (`g`/`rg`/`k`/`sc`/`scn`) and the non-stroking alpha from ExtGState (`gs` reading
 //! `/ca`). Form XObjects are followed read-only with a depth cap. Anything fancier (other filled paths, shadings, patterns) is
 //! out of scope and documented as such.
 //!
@@ -188,6 +188,11 @@ impl<'a> Walker<'a> {
                         gs.fill = [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)];
                     }
                 }
+                b"sc" | b"scn" => {
+                    if let Some(rgb) = sc_rgb(op) {
+                        gs.fill = rgb;
+                    }
+                }
                 b"gs" => {
                     if let Some(name) = op.name(0) {
                         gs.alpha = ext_alpha(self.doc, resources, name);
@@ -274,7 +279,8 @@ impl<'a> Walker<'a> {
                 (v.len() == 6 && v.iter().all(|x| x.is_finite())).then(|| Matrix([v[0], v[1], v[2], v[3], v[4], v[5]]))
             })
             .unwrap_or(Matrix::IDENTITY);
-        let sub_resources = dict.get(b"Resources").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned()).unwrap_or_default();
+        let own_resources = dict.get(b"Resources").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned());
+        let sub_resources = own_resources.as_ref().unwrap_or(resources);
         if !self.budget.enter_form() {
             return Err(AuditError::TooManyForms);
         }
@@ -285,7 +291,24 @@ impl<'a> Walker<'a> {
         let mut sub_gs = gs.clone();
         sub_gs.ctm = matrix.then(&gs.ctm);
         let mut sub_stack = Vec::new();
-        self.walk_ops(&ops, &mut sub_gs, &mut sub_stack, &sub_resources, depth + 1, Some(pos))
+        self.walk_ops(&ops, &mut sub_gs, &mut sub_stack, sub_resources, depth + 1, Some(pos))
+    }
+}
+
+/// Converts 1-, 3-, or 4-component numeric `sc`/`scn` operands (Gray, RGB, or CMYK) into `[r, g, b]`.
+fn sc_rgb(op: &Op) -> Option<[f64; 3]> {
+    let values: Vec<f64> = op.operands.iter().map(Object::as_f64).collect::<Option<_>>()?;
+    if !values.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    match values.as_slice() {
+        [g] => Some([g.clamp(0.0, 1.0); 3]),
+        [r, g, b] => Some([r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]),
+        [c, m, y, k] => {
+            let (c, m, y, k) = (c.clamp(0.0, 1.0), m.clamp(0.0, 1.0), y.clamp(0.0, 1.0), k.clamp(0.0, 1.0));
+            Some([(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)])
+        }
+        _ => None,
     }
 }
 

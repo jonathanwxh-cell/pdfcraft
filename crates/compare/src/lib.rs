@@ -225,8 +225,11 @@ fn hash(s: &str) -> u64 {
 
 /// Merge word boxes on the same page and line into one rectangle per line.
 fn rects(words: &[&Word]) -> Vec<[f64; 4]> {
+    let Some(first) = words.first() else {
+        return Vec::new();
+    };
     let mut out: Vec<[f64; 4]> = Vec::new();
-    for w in words {
+    for w in words.iter().filter(|w| w.page == first.page) {
         let r = w.rect;
         match out.last_mut() {
             Some(l) if (l[1] - r[1]).abs() < (r[3] - r[1]).max(1.0) * 0.5 && r[0] - l[2] < (r[3] - r[1]).max(4.0) * 2.0 && r[0] >= l[0] - 1.0 => {
@@ -239,6 +242,13 @@ fn rects(words: &[&Word]) -> Vec<[f64; 4]> {
         }
     }
     out
+}
+
+fn neighbour<'a>(words: &'a [Word], at: usize, other: &[&Word]) -> Option<&'a Word> {
+    let after = words.get(at);
+    let before = at.checked_sub(1).and_then(|p| words.get(p));
+    let other_page = other.first().map(|w| w.page);
+    if after.map(|w| w.page) != other_page && before.map(|w| w.page) == other_page { before } else { after.or(before) }
 }
 
 fn side(words: &[&Word], neighbour: Option<&Word>) -> Side {
@@ -287,8 +297,8 @@ pub fn compare(old: &[Word], new: &[Word]) -> Comparison {
             _ => Kind::Inserted,
         };
         // Where a one-sided change sits in the other document: next to the neighbouring word.
-        let old_near = old.get(i).or_else(|| old.last());
-        let new_near = new.get(j).or_else(|| new.last());
+        let old_near = neighbour(old, i, &ins);
+        let new_near = neighbour(new, j, &del);
         changes.push(Change { kind, old: side(&del, old_near), new: side(&ins, new_near) });
     }
     Comparison { changes, old_words: old.len(), new_words: new.len() }
@@ -362,6 +372,44 @@ mod tests {
         assert_eq!(c.changes[1].new.page, 1);
         let r = report(&c, "v1.pdf", "v2.pdf");
         assert!(r.contains("2 changes: 0 replaced, 0 inserted, 2 deleted.") && r.contains("Old: epsilon"), "{r}");
+    }
+
+    #[test]
+    fn changes_at_page_boundaries_stay_on_their_own_page() {
+        // Deleting the last word of page 0 ("gamma") must anchor its new-document page and
+        // `near` box to "beta" on page 0, not jump to "delta" at the start of page 1.
+        let mut old = words("alpha beta gamma", 0);
+        old.extend(words("delta epsilon", 1));
+        let mut new = words("alpha beta", 0);
+        new.extend(words("delta epsilon", 1));
+        let c = compare(&old, &new);
+        assert_eq!(c.changes.len(), 1);
+        assert_eq!((c.changes[0].kind, c.changes[0].old.page, c.changes[0].new.page), (Kind::Deleted, 0, 0));
+        assert_eq!(c.changes[0].new.near, Some(new[1].rect), "deletion at end of page 0 anchors to preceding word on page 0");
+
+        // Symmetrically, inserting "gamma" at the end of page 0 must anchor its old-document
+        // page and `near` box to "beta" on page 0, not "delta" on page 1.
+        let c_ins = compare(&new, &old);
+        assert_eq!(c_ins.changes.len(), 1);
+        assert_eq!((c_ins.changes[0].kind, c_ins.changes[0].old.page, c_ins.changes[0].new.page), (Kind::Inserted, 0, 0));
+        assert_eq!(c_ins.changes[0].old.near, Some(new[1].rect), "insertion at end of page 0 anchors to preceding word on page 0");
+
+        // A multi-word change that crosses a page break must not merge or place page 1 word
+        // boxes onto page 0's highlight rectangles.
+        let cross_old = vec![
+            Word { text: "keep".into(), page: 0, rect: [10.0, 700.0, 45.0, 710.0] },
+            Word { text: "end0".into(), page: 0, rect: [50.0, 700.0, 85.0, 710.0] },
+            Word { text: "start1".into(), page: 1, rect: [90.0, 700.0, 125.0, 710.0] },
+            Word { text: "tail".into(), page: 1, rect: [10.0, 680.0, 45.0, 690.0] },
+        ];
+        let cross_new = vec![
+            Word { text: "keep".into(), page: 0, rect: [10.0, 700.0, 45.0, 710.0] },
+            Word { text: "tail".into(), page: 1, rect: [10.0, 680.0, 45.0, 690.0] },
+        ];
+        let c_cross = compare(&cross_old, &cross_new);
+        assert_eq!(c_cross.changes.len(), 1);
+        assert_eq!(c_cross.changes[0].old.page, 0);
+        assert_eq!(c_cross.changes[0].old.rects, [[50.0, 700.0, 85.0, 710.0]]);
     }
 
     #[test]

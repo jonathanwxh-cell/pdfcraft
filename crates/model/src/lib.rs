@@ -18,9 +18,10 @@ pub struct Page {
     pub dict: Dict,
 }
 
+/// Normalized `[x0, y0, x1, y1]` of a page box when its first four entries form a finite, positive rectangle.
 fn rect(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
     let o = doc.resolve(o?);
-    let [a, b, c, d] = o.as_array()?.as_slice() else { return None };
+    let [a, b, c, d, ..] = o.as_array()?.as_slice() else { return None };
     let coords = [doc.resolve(a).as_f64()?, doc.resolve(b).as_f64()?, doc.resolve(c).as_f64()?, doc.resolve(d).as_f64()?];
     if !coords.iter().all(|x| x.is_finite()) {
         return None;
@@ -418,6 +419,9 @@ mod tests {
             assert_eq!(p.crop(&d), [0.0, 0.0, 612.0, 792.0], "{bad_media}");
             assert_eq!(p.display_size(&d), (612.0, 792.0), "{bad_media}");
         }
+        // Four valid leading coordinates with trailing entries match the renderer's crop bounds.
+        let trailing = doc_with(0, "", "/CropBox [0 0 300 792 /Extra]");
+        assert_eq!(pages(&trailing)[0].crop(&trailing), [0.0, 0.0, 300.0, 792.0]);
 
         let mut d = doc_with(0, "", "/CropBox null");
         let leaf = ObjRef { num: 3, generation: 0 };

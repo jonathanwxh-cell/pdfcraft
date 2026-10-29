@@ -491,14 +491,15 @@ fn an_output_intent_profile_header_is_read_within_a_size_cap() {
 
 #[test]
 fn typeless_annotations_indexed_cmyk_and_indirect_filter_elements_are_handled() {
-    // Annotations in /Annots that omit optional /Type /Annot (and /P) are still verified and fixed by convert.
+    // Annotations in /Annots that omit optional /Type /Annot (and /P or /Rect), whether indirect or direct
+    // dictionaries, are still verified and fixed by convert.
     let mut doc = build(
         &[
             "<< /Type /Catalog /Pages 2 0 R >>",
             "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >>",
-            "<< /Type /Page /Parent 2 0 R /Annots [4 0 R 5 0 R 6 0 R] >>",
+            "<< /Type /Page /Parent 2 0 R /Annots [4 0 R 5 0 R 6 0 R << /Subtype /Movie >>] >>",
             "<< /Subtype /Text /Rect [10 10 30 30] /P 3 0 R /AP << /N 7 0 R >> >>",
-            "<< /Subtype /Sound /Rect [40 10 60 30] /P 3 0 R >>",
+            "<< /Subtype /Sound >>",
             "<< /Subtype /Widget /FT /Tx /T (f) /Rect [70 10 90 30] /F 4 /AA << /E << /S /URI /URI (https://example.com) >> >> /AP << /N 7 0 R >> >>",
             "<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 0 >>\nstream\n\nendstream",
         ],
@@ -508,6 +509,7 @@ fn typeless_annotations_indexed_cmyk_and_indirect_filter_elements_are_handled() 
     let msgs = messages(&issues);
     assert!(msgs.contains(&"A Text annotation isn't set to print, or is hidden"), "{msgs:#?}");
     assert!(msgs.contains(&"Sound annotations aren't allowed"), "{msgs:#?}");
+    assert!(msgs.contains(&"Movie annotations aren't allowed"), "{msgs:#?}");
     assert!(msgs.contains(&"A Widget annotation has additional actions"), "{msgs:#?}");
     assert!(!msgs.contains(&"A form field has additional actions"), "{msgs:#?}");
     let r = convert(&mut doc, Level::A2b).unwrap();

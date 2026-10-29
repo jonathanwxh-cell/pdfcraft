@@ -557,24 +557,33 @@ fn check_objects(
 ) {
     for (r, o) in objects {
         let Some(d) = dict_of(o) else { continue };
-        check_one_object(doc, level, *r, d, o, page_of, issue);
+        check_one_object(doc, level, d, o, page_of(*r), issue);
+    }
+    for (i, p) in pdfcraft_model::pages(doc).into_iter().enumerate() {
+        if let Some(a) = p.dict.get(b"Annots").map(|a| doc.resolve(a))
+            && let Some(a) = a.as_array()
+        {
+            for entry in a {
+                if let Object::Dict(d) = entry {
+                    check_one_object(doc, level, d, entry, Some(i), issue);
+                }
+            }
+        }
     }
 }
 
-/// Checks a single indirect object against the PDF/A rules for `level`.
+/// Checks a single object against the PDF/A rules for `level`.
 fn check_one_object(
     doc: &Document,
     level: Level,
-    reference: ObjRef,
     dict: &Dict,
     object: &Object,
-    page_of: &impl Fn(ObjRef) -> Option<usize>,
+    page: Option<usize>,
     issue: &mut impl FnMut(&'static str, &'static str, Option<String>, Option<usize>, bool),
 ) {
     let ty = dict.name(b"Type");
     let subtype = dict.name(b"Subtype");
     check_actions(doc, dict, issue);
-    let page = page_of(reference);
     let is_annot = matches!(object, Object::Dict(_)) && is_annotation(dict, ty, subtype, page.is_some());
     if is_annot && check_annotation(doc, dict, subtype, page, issue) {
         // A forbidden annotation stops every later check for its object, as the scan did before
@@ -606,10 +615,10 @@ fn check_actions(doc: &Document, dict: &Dict, issue: &mut impl FnMut(&'static st
     }
 }
 
-/// Whether `dict` is an annotation dictionary (`/Type /Annot`, or a dictionary with the required
-/// `/Subtype` and `/Rect` keys that either sits in a page's `/Annots` list or names its `/P` page).
+/// Whether `dict` is an annotation dictionary (`/Type /Annot`, or a dictionary with `/Subtype`
+/// that either sits in a page's `/Annots` list or carries both `/Rect` and `/P`).
 fn is_annotation(dict: &Dict, ty: Option<&[u8]>, subtype: Option<&[u8]>, on_page: bool) -> bool {
-    ty == Some(b"Annot") || (subtype.is_some() && dict.get(b"Rect").is_some() && (on_page || dict.get(b"P").is_some()))
+    ty == Some(b"Annot") || (subtype.is_some() && (on_page || (dict.get(b"Rect").is_some() && dict.get(b"P").is_some())))
 }
 
 fn check_annotation(
@@ -850,6 +859,60 @@ fn remove_annot_from_pages(doc: &mut Document, r: ObjRef) -> Result<(), pdfcraft
     Ok(())
 }
 
+fn fix_annot_or_field(doc: &Document, nd: &mut Dict, is_annot: bool, sub: Option<&[u8]>, actions: &mut usize, flags: &mut usize) -> bool {
+    let mut changed = strip_actions(doc, nd);
+    *actions += changed as usize;
+    if is_annot && sub != Some(b"Popup") {
+        let f = nd.int(b"F").unwrap_or(0);
+        let want = (f | 4) & !(1 | 2 | 32);
+        if want != f {
+            nd.set(b"F".to_vec(), Object::Int(want));
+            *flags += 1;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn convert_direct_page_annots(
+    doc: &mut Document,
+    page: &pdfcraft_model::Page,
+    actions: &mut usize,
+    flags: &mut usize,
+    removed: &mut usize,
+) -> Result<(), pdfcraft_cos::CosError> {
+    let Some(annots) = page.dict.get(b"Annots").map(|a| doc.resolve(a)).and_then(|a| a.as_array().cloned()) else {
+        return Ok(());
+    };
+    if !annots.iter().any(|a| a.as_dict().is_some()) {
+        return Ok(());
+    }
+    let mut kept = Vec::with_capacity(annots.len());
+    let mut changed = false;
+    for entry in annots {
+        let Object::Dict(mut nd) = entry else {
+            kept.push(entry);
+            continue;
+        };
+        let ty = nd.name(b"Type").map(<[u8]>::to_vec);
+        let sub = nd.name(b"Subtype").map(<[u8]>::to_vec);
+        let is_annot = is_annotation(&nd, ty.as_deref(), sub.as_deref(), true);
+        if is_annot && sub.as_deref().is_some_and(|s| FORBIDDEN_ANNOTS.contains(&s)) {
+            *removed += 1;
+            changed = true;
+            continue;
+        }
+        if is_annot || nd.get(b"FT").is_some() {
+            changed |= fix_annot_or_field(doc, &mut nd, is_annot, sub.as_deref(), actions, flags);
+        }
+        kept.push(Object::Dict(nd));
+    }
+    if changed {
+        doc.update_dict(page.obj, |pd| pd.set(b"Annots".to_vec(), Object::Array(kept)))?;
+    }
+    Ok(())
+}
+
 /// Make `doc` conform to `level` as far as possible, then re-check it.
 pub fn convert(doc: &mut Document, level: Level) -> Result<Report, pdfcraft_cos::CosError> {
     let mut fixed = Vec::new();
@@ -922,6 +985,7 @@ pub fn convert(doc: &mut Document, level: Level) -> Result<Report, pdfcraft_cos:
         let mut changed = false;
         doc.update_dict(p.obj, |d| changed = d.remove(b"AA").is_some())?;
         actions += changed as usize;
+        convert_direct_page_annots(doc, &p, &mut actions, &mut flags, &mut removed)?;
     }
     for (r, o) in objects(doc) {
         let Some(d) = dict_of(&o).cloned() else { continue };
@@ -935,18 +999,7 @@ pub fn convert(doc: &mut Document, level: Level) -> Result<Report, pdfcraft_cos:
         }
         if matches!(&*o, Object::Dict(_)) && (is_annot || d.get(b"FT").is_some()) {
             let mut nd = d.clone();
-            let mut changed = strip_actions(doc, &mut nd);
-            actions += changed as usize;
-            if is_annot && sub.as_deref() != Some(b"Popup") {
-                let f = nd.int(b"F").unwrap_or(0);
-                let want = (f | 4) & !(1 | 2 | 32);
-                if want != f {
-                    nd.set(b"F".to_vec(), Object::Int(want));
-                    flags += 1;
-                    changed = true;
-                }
-            }
-            if changed {
+            if fix_annot_or_field(doc, &mut nd, is_annot, sub.as_deref(), &mut actions, &mut flags) {
                 doc.set(r, Object::Dict(nd));
             }
             continue;

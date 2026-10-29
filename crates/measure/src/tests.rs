@@ -494,7 +494,7 @@ fn indirect_scale_fields_and_closed_area_edges_are_handled() {
     let factor_d_ref = d.add(Object::Real(1.0));
     let factor_a_ref = d.add(Object::Real(1.0));
     let fmt_d_ref = d.add(Object::name("D"));
-    let denom_ref = d.add(Object::Int(100));
+    let denom_ref = d.add(Object::Int(1000));
 
     let nf = |u: ObjRef, c: ObjRef| {
         let mut f = Dict::new();
@@ -529,5 +529,5 @@ fn indirect_scale_fields_and_closed_area_edges_are_handled() {
     assert_eq!(item.id, "area-indirect");
     assert_eq!(item.author, "Architect");
     assert_eq!(item.label, "Floor Plan");
-    assert_eq!(item.scale, Scale { y: 3.0, ..Scale::new(2.0, "m", 2).unwrap() });
+    assert_eq!(item.scale, Scale { y: 3.0, ..Scale::new(2.0, "m", 3).unwrap() });
 }

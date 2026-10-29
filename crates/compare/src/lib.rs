@@ -225,11 +225,8 @@ fn hash(s: &str) -> u64 {
 
 /// Merge word boxes on the same page and line into one rectangle per line.
 fn rects(words: &[&Word]) -> Vec<[f64; 4]> {
-    let Some(first) = words.first() else {
-        return Vec::new();
-    };
     let mut out: Vec<[f64; 4]> = Vec::new();
-    for w in words.iter().filter(|w| w.page == first.page) {
+    for w in words {
         let r = w.rect;
         match out.last_mut() {
             Some(l) if (l[1] - r[1]).abs() < (r[3] - r[1]).max(1.0) * 0.5 && r[0] - l[2] < (r[3] - r[1]).max(4.0) * 2.0 && r[0] >= l[0] - 1.0 => {

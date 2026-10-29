@@ -530,6 +530,8 @@ fn typeless_annotations_indexed_cmyk_and_indirect_filter_elements_are_handled() 
 
     let res_cmyk = drawing("/CS0 cs 0 sc 0 0 10 10 re f", "/ColorSpace << /CS0 [/Indexed /DeviceCMYK 0 <00000000>] >>", &[]);
     assert!(uses_cmyk(&res_cmyk));
+    let pattern_cmyk = drawing("0 0 10 10 re f", "/ColorSpace << /CS0 [/Pattern /DeviceCMYK] >>", &[]);
+    assert!(uses_cmyk(&pattern_cmyk));
 
     // An indirect filter name inside a /Filter array is still checked for LZWDecode.
     let indirect_lzw = build(

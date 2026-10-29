@@ -392,7 +392,7 @@ fn mark_cs_object(doc: &Document, cs: &Object, used: &mut DeviceColour, depth: u
         Object::Name(n) => used.mark(n, false),
         Object::Array(a) => match a.first().map(|o| doc.resolve(o)).as_deref().and_then(Object::as_name) {
             Some(n) if a.len() == 1 => used.mark(n, false),
-            Some(b"I" | b"Indexed") => {
+            Some(b"I" | b"Indexed" | b"Pattern") => {
                 if let Some(base) = a.get(1) {
                     mark_cs_object(doc, base, used, depth + 1);
                 }

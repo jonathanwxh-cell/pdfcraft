@@ -90,7 +90,7 @@ fn explicit_array(doc: &Document, o: &Object) -> Option<Vec<Object>> {
 fn valid_explicit(doc: &Document, o: &Object, pages: &HashSet<ObjRef>, count: usize) -> bool {
     explicit_array(doc, o).is_some_and(|a| match a.first() {
         Some(Object::Ref(r)) => pages.contains(r),
-        Some(Object::Int(i)) => *i >= 0 && (*i as usize) < count,
+        Some(Object::Int(i)) => usize::try_from(*i).is_ok_and(|i| i < count),
         _ => false,
     })
 }

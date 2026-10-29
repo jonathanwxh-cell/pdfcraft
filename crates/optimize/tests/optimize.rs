@@ -3501,8 +3501,13 @@ fn dictionary_destinations_broken_named_destinations_and_both_dest_tables() {
     // destination to `missing` (invalid), (3) named destination "dict_ok" whose value is
     // `<< /D [p /Fit] >>` (valid), (4) named destination "broken_tree" whose target page is
     // `missing` (invalid).
-    let annots =
-        vec![link(&mut doc, dict_dest(p)), link(&mut doc, dict_dest(missing)), link(&mut doc, s("dict_ok")), link(&mut doc, s("broken_tree"))];
+    let annots = vec![
+        link(&mut doc, dict_dest(p)),
+        link(&mut doc, dict_dest(missing)),
+        link(&mut doc, Object::Array(vec![Object::Int(i64::from(u32::MAX) + 1), Object::name("Fit")])),
+        link(&mut doc, s("dict_ok")),
+        link(&mut doc, s("broken_tree")),
+    ];
     doc.update_dict(p, |d| d.set(b"Annots".to_vec(), Object::Array(annots))).unwrap();
 
     // Bookmark with an indirect GoTo action pointing to "broken_old" in catalog /Dests (whose
@@ -3564,7 +3569,7 @@ fn dictionary_destinations_broken_named_destinations_and_both_dest_tables() {
     assert!(both_tables > only_tree, "catalog /Dests is counted alongside /Names /Dests: {both_tables} vs {only_tree}");
 
     let report = optimize(&mut doc, &Settings::default()).unwrap();
-    assert_eq!((report.invalid_links, report.invalid_bookmarks, report.unreferenced_dests), (2, 1, 2), "{report:?}");
+    assert_eq!((report.invalid_links, report.invalid_bookmarks, report.unreferenced_dests), (3, 1, 2), "{report:?}");
     let left_links = doc.get(p).as_dict().unwrap().get(b"Annots").unwrap().as_array().unwrap().len();
     assert_eq!(left_links, 2, "the two valid dictionary/named links remain");
     assert!(doc.get(bm_broken).as_dict().unwrap().get(b"A").is_none(), "broken bookmark action is cleared");

@@ -488,3 +488,57 @@ fn an_output_intent_profile_header_is_read_within_a_size_cap() {
         assert_eq!(pdfa_intent_profile(&doc), Some(n), "a {size}-byte profile");
     }
 }
+
+#[test]
+fn typeless_annotations_indexed_cmyk_and_indirect_filter_elements_are_handled() {
+    // Annotations in /Annots that omit optional /Type /Annot (and /P) are still verified and fixed by convert.
+    let mut doc = build(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >>",
+            "<< /Type /Page /Parent 2 0 R /Annots [4 0 R 5 0 R 6 0 R] >>",
+            "<< /Subtype /Text /Rect [10 10 30 30] /P 3 0 R /AP << /N 7 0 R >> >>",
+            "<< /Subtype /Sound /Rect [40 10 60 30] /P 3 0 R >>",
+            "<< /Subtype /Widget /FT /Tx /T (f) /Rect [70 10 90 30] /F 4 /AA << /E << /S /URI /URI (https://example.com) >> >> /AP << /N 7 0 R >> >>",
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 0 >>\nstream\n\nendstream",
+        ],
+        "",
+    );
+    let issues = verify(&doc, Level::A2b);
+    let msgs = messages(&issues);
+    assert!(msgs.contains(&"A Text annotation isn't set to print, or is hidden"), "{msgs:#?}");
+    assert!(msgs.contains(&"Sound annotations aren't allowed"), "{msgs:#?}");
+    assert!(msgs.contains(&"A Widget annotation has additional actions"), "{msgs:#?}");
+    assert!(!msgs.contains(&"A form field has additional actions"), "{msgs:#?}");
+    let r = convert(&mut doc, Level::A2b).unwrap();
+    assert!(r.remaining.is_empty(), "{:#?}", r.remaining);
+
+    // Indexed and Separation colour spaces over DeviceCMYK on image XObjects or /ColorSpace resources count as CMYK.
+    let indexed_img = build(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >>",
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /Im0 5 0 R >> >> >>",
+            "<< /Length 7 >>\nstream\n/Im0 Do\nendstream",
+            "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/Indexed /DeviceCMYK 0 <00000000>] /BitsPerComponent 8 /Length 1 >>\nstream\n\u{0}\nendstream",
+        ],
+        "",
+    );
+    assert!(uses_cmyk(&indexed_img));
+
+    let res_cmyk = drawing("/CS0 cs 0 sc 0 0 10 10 re f", "/ColorSpace << /CS0 [/Indexed /DeviceCMYK 0 <00000000>] >>", &[]);
+    assert!(uses_cmyk(&res_cmyk));
+
+    // An indirect filter name inside a /Filter array is still checked for LZWDecode.
+    let indirect_lzw = build(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >>",
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+            "<< /Filter [5 0 R] /Length 0 >>\nstream\n\nendstream",
+            "/LZWDecode",
+        ],
+        "",
+    );
+    assert!(messages(&verify(&indirect_lzw, Level::A2b)).contains(&"A stream uses LZW compression"));
+}

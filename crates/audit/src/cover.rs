@@ -39,9 +39,24 @@ pub struct FilledRect {
     pub pos: (usize, usize),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BaseSpace {
+    Gray,
+    Rgb,
+    Cmyk,
+}
+
+#[derive(Clone)]
+enum ColorSpace {
+    Base(BaseSpace),
+    Indexed { base: BaseSpace, hival: usize, table: Vec<u8> },
+    Unsupported,
+}
+
 #[derive(Clone)]
 struct Gs {
     ctm: Matrix,
+    cs: ColorSpace,
     fill: [f64; 3],
     alpha: f64,
 }
@@ -100,7 +115,7 @@ fn lines_rect(mut pts: Vec<[f64; 2]>) -> Option<[f64; 4]> {
 
 impl Default for Gs {
     fn default() -> Self {
-        Gs { ctm: Matrix::IDENTITY, fill: [0.0, 0.0, 0.0], alpha: 1.0 }
+        Gs { ctm: Matrix::IDENTITY, cs: ColorSpace::Base(BaseSpace::Gray), fill: [0.0, 0.0, 0.0], alpha: 1.0 }
     }
 }
 
@@ -167,12 +182,14 @@ impl<'a> Walker<'a> {
                     }
                 }
                 b"g" => {
+                    gs.cs = ColorSpace::Base(BaseSpace::Gray);
                     if let Some(v) = op.num(0).filter(|v| v.is_finite()) {
                         let v = v.clamp(0.0, 1.0);
                         gs.fill = [v, v, v];
                     }
                 }
                 b"rg" => {
+                    gs.cs = ColorSpace::Base(BaseSpace::Rgb);
                     if let Some([r, g, b]) = op.nums::<3>()
                         && [r, g, b].iter().all(|v| v.is_finite())
                     {
@@ -180,6 +197,7 @@ impl<'a> Walker<'a> {
                     }
                 }
                 b"k" => {
+                    gs.cs = ColorSpace::Base(BaseSpace::Cmyk);
                     if let Some([c, m, y, k]) = op.nums::<4>()
                         && [c, m, y, k].iter().all(|v| v.is_finite())
                     {
@@ -188,8 +206,11 @@ impl<'a> Walker<'a> {
                         gs.fill = [(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)];
                     }
                 }
+                b"cs" => {
+                    gs.cs = self.resolve_color_space(&op.operands, resources)?;
+                }
                 b"sc" | b"scn" => {
-                    if let Some(rgb) = sc_rgb(op) {
+                    if let Some(rgb) = sc_rgb(&gs.cs, op) {
                         gs.fill = rgb;
                     }
                 }
@@ -293,22 +314,122 @@ impl<'a> Walker<'a> {
         let mut sub_stack = Vec::new();
         self.walk_ops(&ops, &mut sub_gs, &mut sub_stack, sub_resources, depth + 1, Some(pos))
     }
+
+    /// Resolves a colour-space operand list (`cs`) against the page/form `/ColorSpace` resource dictionary.
+    fn resolve_color_space(&mut self, operands: &[Object], resources: &Dict) -> Result<ColorSpace, AuditError> {
+        let cs_dict = resources.get(b"ColorSpace").map(|o| self.doc.resolve(o)).and_then(|o| o.as_dict().cloned());
+        match operands {
+            [Object::Name(name)] => {
+                if let Some(b) = base_space(name) {
+                    return Ok(ColorSpace::Base(b));
+                }
+                let Some(entry) = cs_dict.as_ref().and_then(|d| d.get(name)) else {
+                    return Ok(ColorSpace::Unsupported);
+                };
+                let resolved = self.doc.resolve(entry);
+                match &*resolved {
+                    Object::Name(n) => Ok(base_space(n).map_or(ColorSpace::Unsupported, ColorSpace::Base)),
+                    Object::Array(arr) => self.resolve_cs_array(arr, cs_dict.as_ref()),
+                    _ => Ok(ColorSpace::Unsupported),
+                }
+            }
+            [Object::Array(arr)] => self.resolve_cs_array(arr, cs_dict.as_ref()),
+            arr if arr.len() == 4 => self.resolve_cs_array(arr, cs_dict.as_ref()),
+            _ => Ok(ColorSpace::Unsupported),
+        }
+    }
+
+    /// Resolves a colour-space array (`[/DeviceRGB]` or `[/Indexed base hival lookup]`).
+    fn resolve_cs_array(&mut self, arr: &[Object], cs_dict: Option<&Dict>) -> Result<ColorSpace, AuditError> {
+        let Some(first) = arr.first().map(|o| self.doc.resolve(o)) else {
+            return Ok(ColorSpace::Unsupported);
+        };
+        let Some(kind) = first.as_name() else {
+            return Ok(ColorSpace::Unsupported);
+        };
+        if arr.len() == 1 {
+            return Ok(base_space(kind).map_or(ColorSpace::Unsupported, ColorSpace::Base));
+        }
+        if !matches!(kind, b"Indexed" | b"I") || arr.len() != 4 {
+            return Ok(ColorSpace::Unsupported);
+        }
+        let base_obj = self.doc.resolve(&arr[1]);
+        let base = match &*base_obj {
+            Object::Name(n) => base_space(n).or_else(|| {
+                let resolved = cs_dict?.get(n).map(|o| self.doc.resolve(o))?;
+                match &*resolved {
+                    Object::Name(bn) => base_space(bn),
+                    Object::Array(ba) if ba.len() == 1 => self.doc.resolve(&ba[0]).as_name().and_then(base_space),
+                    _ => None,
+                }
+            }),
+            Object::Array(ba) if ba.len() == 1 => self.doc.resolve(&ba[0]).as_name().and_then(base_space),
+            _ => None,
+        };
+        let Some(base) = base else {
+            return Ok(ColorSpace::Unsupported);
+        };
+        let Some(hival) = self.doc.resolve(&arr[2]).as_int().filter(|&h| (0..=255).contains(&h)) else {
+            return Ok(ColorSpace::Unsupported);
+        };
+        let lookup = self.doc.resolve(&arr[3]);
+        let table = match &*lookup {
+            Object::String(s) => s.bytes.clone(),
+            Object::Stream(stream) => self.budget.decode_strict(stream)?,
+            _ => return Ok(ColorSpace::Unsupported),
+        };
+        Ok(ColorSpace::Indexed { base, hival: hival as usize, table })
+    }
 }
 
-/// Converts 1-, 3-, or 4-component numeric `sc`/`scn` operands (Gray, RGB, or CMYK) into `[r, g, b]`.
-fn sc_rgb(op: &Op) -> Option<[f64; 3]> {
-    let values: Vec<f64> = op.operands.iter().map(Object::as_f64).collect::<Option<_>>()?;
+/// Maps a device colour-space name (or its inline-image abbreviation) to [`BaseSpace`].
+fn base_space(name: &[u8]) -> Option<BaseSpace> {
+    match name {
+        b"DeviceGray" | b"G" => Some(BaseSpace::Gray),
+        b"DeviceRGB" | b"RGB" => Some(BaseSpace::Rgb),
+        b"DeviceCMYK" | b"CMYK" => Some(BaseSpace::Cmyk),
+        _ => None,
+    }
+}
+
+/// Converts finite colour components in `base` into `[r, g, b]`.
+fn base_rgb(base: BaseSpace, values: &[f64]) -> Option<[f64; 3]> {
     if !values.iter().all(|v| v.is_finite()) {
         return None;
     }
-    match values.as_slice() {
-        [g] => Some([g.clamp(0.0, 1.0); 3]),
-        [r, g, b] => Some([r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]),
-        [c, m, y, k] => {
+    match (base, values) {
+        (BaseSpace::Gray, &[g]) => Some([g.clamp(0.0, 1.0); 3]),
+        (BaseSpace::Rgb, &[r, g, b]) => Some([r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]),
+        (BaseSpace::Cmyk, &[c, m, y, k]) => {
             let (c, m, y, k) = (c.clamp(0.0, 1.0), m.clamp(0.0, 1.0), y.clamp(0.0, 1.0), k.clamp(0.0, 1.0));
             Some([(1.0 - c) * (1.0 - k), (1.0 - m) * (1.0 - k), (1.0 - y) * (1.0 - k)])
         }
         _ => None,
+    }
+}
+
+/// Evaluates `sc` or `scn` operands against the active non-stroking [`ColorSpace`].
+fn sc_rgb(cs: &ColorSpace, op: &Op) -> Option<[f64; 3]> {
+    let values: Vec<f64> = op.operands.iter().map(Object::as_f64).collect::<Option<_>>()?;
+    if !values.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    match cs {
+        ColorSpace::Base(base) => base_rgb(*base, &values),
+        ColorSpace::Indexed { base, hival, table } => {
+            let &[idx] = values.as_slice() else { return None };
+            let i = (idx.round().max(0.0) as usize).min(*hival);
+            let stride = match base {
+                BaseSpace::Gray => 1,
+                BaseSpace::Rgb => 3,
+                BaseSpace::Cmyk => 4,
+            };
+            let start = i.checked_mul(stride)?;
+            let bytes = table.get(start..start.checked_add(stride)?)?;
+            let comps: Vec<f64> = bytes.iter().map(|&b| f64::from(b) / 255.0).collect();
+            base_rgb(*base, &comps)
+        }
+        ColorSpace::Unsupported => None,
     }
 }
 

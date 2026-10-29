@@ -349,8 +349,9 @@ fn annots(doc: &Document, page: &Dict) -> Result<Vec<AnnotationCover>, AuditErro
                 }
                 let ca_stroke = dict.get(b"CA").map(|o| doc.resolve(o)).and_then(|o| o.as_f64()).unwrap_or(1.0);
                 let ca_fill = dict.get(b"ca").map(|o| doc.resolve(o)).and_then(|o| o.as_f64()).unwrap_or(1.0);
+                let has_appearance = dict.get(b"AP").is_some();
                 if ca_stroke >= 1.0
-                    && ca_fill >= 1.0
+                    && (has_appearance || ca_fill >= 1.0)
                     && let Some(rgb) = annotation_color(doc, &dict, b"IC")
                 {
                     out.push(AnnotationCover::Square { rect, rgb });

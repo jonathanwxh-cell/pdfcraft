@@ -532,8 +532,10 @@ fn typeless_annotations_indexed_cmyk_and_indirect_filter_elements_are_handled() 
     assert!(uses_cmyk(&res_cmyk));
     let pattern_cmyk = drawing("0 0 10 10 re f", "/ColorSpace << /CS0 [/Pattern /DeviceCMYK] >>", &[]);
     assert!(uses_cmyk(&pattern_cmyk));
+    let chained_cs = drawing("0 0 10 10 re f", "/ColorSpace << /CS0 5 0 R >>", &["6 0 R", "[7 0 R 8 0 R]", "/Pattern", "/DeviceCMYK"]);
+    assert!(uses_cmyk(&chained_cs));
 
-    // An indirect filter name inside a /Filter array is still checked for LZWDecode.
+    // An indirect filter name inside a /Filter array or the /LZW abbreviation is still checked for LZWDecode.
     let indirect_lzw = build(
         &[
             "<< /Type /Catalog /Pages 2 0 R >>",
@@ -545,4 +547,14 @@ fn typeless_annotations_indexed_cmyk_and_indirect_filter_elements_are_handled() 
         "",
     );
     assert!(messages(&verify(&indirect_lzw, Level::A2b)).contains(&"A stream uses LZW compression"));
+    let abbrev_lzw = build(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >>",
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+            "<< /Filter /LZW /Length 0 >>\nstream\n\nendstream",
+        ],
+        "",
+    );
+    assert!(messages(&verify(&abbrev_lzw, Level::A2b)).contains(&"A stream uses LZW compression"));
 }

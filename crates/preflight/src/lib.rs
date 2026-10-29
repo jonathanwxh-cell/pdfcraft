@@ -388,22 +388,30 @@ fn mark_cs_object(doc: &Document, cs: &Object, used: &mut DeviceColour, depth: u
     if depth > MAX_DIRECT_DEPTH {
         return;
     }
-    match &*doc.resolve(cs) {
+    match cs {
+        Object::Ref(r) => mark_cs_object(doc, &doc.get(*r), used, depth + 1),
         Object::Name(n) => used.mark(n, false),
-        Object::Array(a) => match a.first().map(|o| doc.resolve(o)).as_deref().and_then(Object::as_name) {
-            Some(n) if a.len() == 1 => used.mark(n, false),
-            Some(b"I" | b"Indexed" | b"Pattern") => {
-                if let Some(base) = a.get(1) {
-                    mark_cs_object(doc, base, used, depth + 1);
-                }
+        Object::Array(a) => {
+            let mut kind = a.first().map(|o| doc.resolve(o));
+            for _ in 0..MAX_DIRECT_DEPTH {
+                let Some(&Object::Ref(r)) = kind.as_deref() else { break };
+                kind = Some(doc.get(r));
             }
-            Some(b"Separation" | b"DeviceN") => {
-                if let Some(alt) = a.get(2) {
-                    mark_cs_object(doc, alt, used, depth + 1);
+            match kind.as_deref().and_then(Object::as_name) {
+                Some(n) if a.len() == 1 => used.mark(n, false),
+                Some(b"I" | b"Indexed" | b"Pattern") => {
+                    if let Some(base) = a.get(1) {
+                        mark_cs_object(doc, base, used, depth + 1);
+                    }
                 }
+                Some(b"Separation" | b"DeviceN") => {
+                    if let Some(alt) = a.get(2) {
+                        mark_cs_object(doc, alt, used, depth + 1);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        },
+        }
         _ => {}
     }
 }
@@ -684,7 +692,7 @@ fn check_stream(
         },
         None => Vec::new(),
     };
-    if filters.iter().any(|filter| filter == b"LZWDecode") {
+    if filters.iter().any(|filter| filter == b"LZWDecode" || filter == b"LZW") {
         issue("6.1.7.2", "A stream uses LZW compression", None, None, false);
     }
     if stream.dict.get(b"F").is_some() || stream.dict.get(b"FFilter").is_some() {

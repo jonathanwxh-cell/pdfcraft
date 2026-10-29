@@ -81,8 +81,7 @@ fn solve8(mut m: [[f64; 9]; 8]) -> Option<[f64; 8]> {
     Some(out)
 }
 
-/// Returns `true` when all four points are finite and no three of them are collinear relative to
-/// their bounding-box extent.
+/// Returns `true` when all four points are finite and no three of them are collinear.
 fn in_general_position(points: [Point; 4]) -> bool {
     if points.iter().flatten().any(|v| !v.is_finite()) {
         return false;
@@ -91,15 +90,20 @@ fn in_general_position(points: [Point; 4]) -> bool {
     let max_x = points.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max);
     let min_y = points.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min);
     let max_y = points.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max);
-    let size = (max_x - min_x).max(max_y - min_y);
-    if size <= 0.0 || !size.is_finite() {
+    let span = max_x - min_x;
+    let rise = max_y - min_y;
+    if span <= 0.0 || rise <= 0.0 || !span.is_finite() || !rise.is_finite() {
         return false;
     }
-    let q = points.map(|[x, y]| [(x - min_x) / size, (y - min_y) / size]);
+    let q = points.map(|[x, y]| [(x - min_x) / span, (y - min_y) / rise]);
     let cross = |o: Point, a: Point, b: Point| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let dist = |a: Point, b: Point| (a[0] - b[0]).hypot(a[1] - b[1]);
     (0..4).all(|i| {
-        let c = cross(q[i], q[(i + 1) % 4], q[(i + 2) % 4]);
-        c.is_finite() && c.abs() > 1e-9
+        let (o, a, b) = (q[i], q[(i + 1) % 4], q[(i + 2) % 4]);
+        let (d0, d1, d2) = (dist(o, a), dist(a, b), dist(b, o));
+        let (l_min, l_max) = (d0.min(d1).min(d2), d0.max(d1).max(d2));
+        let c = cross(o, a, b);
+        l_min > 0.0 && c.is_finite() && c.abs() > 1e-9 * l_min * l_max
     })
 }
 
@@ -129,8 +133,12 @@ pub fn order_quad(points: [Point; 4]) -> Option<[Point; 4]> {
         let (na, nb) = (norm(*a), norm(*b));
         (na[1] - cy).atan2(na[0] - cx).total_cmp(&(nb[1] - cy).atan2(nb[0] - cx))
     });
-    let score = |p: Point| (p[0] - min_x) / span + (p[1] - min_y) / rise;
-    let first = (0..4).min_by(|&a, &b| score(q[a]).total_cmp(&score(q[b])))?;
+    // Score each candidate rotation by its normalised left-edge x and top-edge y.
+    let score = |i: usize| {
+        let (tl, tr, bl) = (q[i], q[(i + 1) % 4], q[(i + 3) % 4]);
+        ((tl[0] - min_x) + (bl[0] - min_x)) / span + ((tl[1] - min_y) + (tr[1] - min_y)) / rise
+    };
+    let first = (0..4).min_by(|&a, &b| score(a).total_cmp(&score(b)))?;
     q.rotate_left(first);
     // Convex, with every turn the same way, and not a sliver.
     let nq = q.map(norm);
@@ -164,6 +172,10 @@ mod tests {
         let r = [[0.0, 0.0], [10.0, 0.0], [10.0, 20.0], [0.0, 20.0]];
         let h = Homography::from_points(r, r).unwrap();
         assert!(close(h.apply([3.0, 7.0]).unwrap(), [3.0, 7.0]));
+
+        let narrow = [[0.0, 0.0], [1e10, 0.0], [1e10, 1.0], [0.0, 1.0]];
+        let h_narrow = Homography::from_points(narrow, narrow).unwrap();
+        assert!(close(h_narrow.apply([5e9, 0.5]).unwrap(), [5e9, 0.5]));
     }
 
     #[test]
@@ -217,6 +229,11 @@ mod tests {
         // yet tl is still top-left.
         let (tl, tr, br, bl) = ([20.0, 100.0], [80.0, 10.0], [140.0, 400.0], [80.0, 490.0]);
         assert_eq!(order_quad([tr, bl, tl, br]), Some([tl, tr, br, bl]));
+
+        // A foreshortened portrait quad where bl sits at x = 0 and y = 60 while tl sits at [40, 0]
+        // still orders [40, 0] as top-left.
+        let (tl, tr, br, bl) = ([40.0, 0.0], [100.0, 10.0], [100.0, 200.0], [0.0, 60.0]);
+        assert_eq!(order_quad([bl, br, tr, tl]), Some([tl, tr, br, bl]));
 
         // Large finite coordinates where `size * size` would overflow f64 still order cleanly.
         let s = 1e160;

@@ -244,13 +244,36 @@ fn rects(words: &[&Word]) -> Vec<[f64; 4]> {
     out
 }
 
-fn neighbour<'a>(words: &'a [Word], at: usize, other: &[&Word]) -> Option<&'a Word> {
-    let after = words.get(at);
-    let before = at.checked_sub(1).and_then(|p| words.get(p));
-    let other_page = other.first().map(|w| w.page);
-    if after.map(|w| w.page) != other_page && before.map(|w| w.page) == other_page { before } else { after.or(before) }
+/// Split `start..end` in `words` into contiguous index ranges that stay on the same page.
+fn page_runs(words: &[Word], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut s = start;
+    while s < end {
+        let page = words[s].page;
+        let mut e = s + 1;
+        while e < end && words[e].page == page {
+            e += 1;
+        }
+        runs.push((s, e));
+        s = e;
+    }
+    runs
 }
 
+/// Pick the neighbouring word in `words` next to `at` for a one-sided change spanning
+/// `start..end` in `changed_doc`, preferring `before` when the change sits at the end of
+/// its page in `changed_doc`.
+fn neighbour<'a>(words: &'a [Word], at: usize, changed_doc: &[Word], start: usize, end: usize) -> Option<&'a Word> {
+    let after = words.get(at);
+    let before = at.checked_sub(1).and_then(|p| words.get(p));
+    let first_page = changed_doc.get(start).map(|w| w.page);
+    let last_page = end.checked_sub(1).and_then(|p| changed_doc.get(p)).map(|w| w.page);
+    let before_same_page = start.checked_sub(1).and_then(|p| changed_doc.get(p)).map(|w| w.page) == first_page;
+    let after_same_page = changed_doc.get(end).map(|w| w.page) == last_page;
+    if !after_same_page && before_same_page { before.or(after) } else { after.or(before) }
+}
+
+/// Build one side of a [`Change`] from its changed words or its anchor word in that document.
 fn side(words: &[&Word], neighbour: Option<&Word>) -> Side {
     Side {
         text: words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "),
@@ -277,29 +300,31 @@ pub fn compare(old: &[Word], new: &[Word]) -> Comparison {
             k += 1;
             continue;
         }
-        let (mut del, mut ins): (Vec<&Word>, Vec<&Word>) = (Vec::new(), Vec::new());
+        let (i0, j0) = (i, j);
         while k < ops.len() && ops[k] != Op::Equal {
             match ops[k] {
-                Op::Delete => {
-                    del.push(&old[i]);
-                    i += 1;
-                }
-                _ => {
-                    ins.push(&new[j]);
-                    j += 1;
-                }
+                Op::Delete => i += 1,
+                _ => j += 1,
             }
             k += 1;
         }
-        let kind = match (del.is_empty(), ins.is_empty()) {
-            (false, false) => Kind::Replaced,
-            (false, true) => Kind::Deleted,
-            _ => Kind::Inserted,
-        };
-        // Where a one-sided change sits in the other document: next to the neighbouring word.
-        let old_near = neighbour(old, i, &ins);
-        let new_near = neighbour(new, j, &del);
-        changes.push(Change { kind, old: side(&del, old_near), new: side(&ins, new_near) });
+        let del_runs = page_runs(old, i0, i);
+        let ins_runs = page_runs(new, j0, j);
+        for r in 0..del_runs.len().max(ins_runs.len()) {
+            let (ds, de) = del_runs.get(r).copied().unwrap_or((i, i));
+            let (is, ie) = ins_runs.get(r).copied().unwrap_or((j, j));
+            let del: Vec<&Word> = old[ds..de].iter().collect();
+            let ins: Vec<&Word> = new[is..ie].iter().collect();
+            let kind = match (del.is_empty(), ins.is_empty()) {
+                (false, false) => Kind::Replaced,
+                (false, true) => Kind::Deleted,
+                _ => Kind::Inserted,
+            };
+            // Where a one-sided change sits in the other document: next to the neighbouring word.
+            let old_near = neighbour(old, ds, new, is, ie);
+            let new_near = neighbour(new, is, old, ds, de);
+            changes.push(Change { kind, old: side(&del, old_near), new: side(&ins, new_near) });
+        }
     }
     Comparison { changes, old_words: old.len(), new_words: new.len() }
 }
@@ -394,8 +419,8 @@ mod tests {
         assert_eq!((c_ins.changes[0].kind, c_ins.changes[0].old.page, c_ins.changes[0].new.page), (Kind::Inserted, 0, 0));
         assert_eq!(c_ins.changes[0].old.near, Some(new[1].rect), "insertion at end of page 0 anchors to preceding word on page 0");
 
-        // A multi-word change that crosses a page break must not merge or place page 1 word
-        // boxes onto page 0's highlight rectangles.
+        // A multi-word change that crosses a page break splits into one Change per page so
+        // every page keeps its own highlight rectangles and anchor page.
         let cross_old = vec![
             Word { text: "keep".into(), page: 0, rect: [10.0, 700.0, 45.0, 710.0] },
             Word { text: "end0".into(), page: 0, rect: [50.0, 700.0, 85.0, 710.0] },
@@ -407,9 +432,28 @@ mod tests {
             Word { text: "tail".into(), page: 1, rect: [10.0, 680.0, 45.0, 690.0] },
         ];
         let c_cross = compare(&cross_old, &cross_new);
-        assert_eq!(c_cross.changes.len(), 1);
-        assert_eq!(c_cross.changes[0].old.page, 0);
+        assert_eq!(c_cross.changes.len(), 2);
+        assert_eq!((c_cross.changes[0].old.page, c_cross.changes[0].new.page), (0, 0));
         assert_eq!(c_cross.changes[0].old.rects, [[50.0, 700.0, 85.0, 710.0]]);
+        assert_eq!((c_cross.changes[1].old.page, c_cross.changes[1].new.page), (1, 1));
+        assert_eq!(c_cross.changes[1].old.rects, [[90.0, 700.0, 125.0, 710.0]]);
+
+        // Even when page numbers are shifted between old and new (e.g. a leading page was removed),
+        // deleting the last word of old page 1 ("X") still anchors to "A" on new page 0 rather than
+        // jumping to "B" on new page 1 just because new page 1 == old page 1.
+        let shifted_old = vec![
+            Word { text: "A".into(), page: 1, rect: [10.0, 700.0, 45.0, 710.0] },
+            Word { text: "X".into(), page: 1, rect: [50.0, 700.0, 85.0, 710.0] },
+            Word { text: "B".into(), page: 2, rect: [10.0, 700.0, 45.0, 710.0] },
+        ];
+        let shifted_new = vec![
+            Word { text: "A".into(), page: 0, rect: [10.0, 700.0, 45.0, 710.0] },
+            Word { text: "B".into(), page: 1, rect: [10.0, 700.0, 45.0, 710.0] },
+        ];
+        let c_shifted = compare(&shifted_old, &shifted_new);
+        assert_eq!(c_shifted.changes.len(), 1);
+        assert_eq!((c_shifted.changes[0].old.page, c_shifted.changes[0].new.page), (1, 0));
+        assert_eq!(c_shifted.changes[0].new.near, Some(shifted_new[0].rect));
     }
 
     #[test]

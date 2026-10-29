@@ -246,9 +246,10 @@ fn page_runs(words: &[Word], start: usize, end: usize) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
     let mut s = start;
     while s < end {
-        let page = words[s].page;
+        let Some(first) = words.get(s) else { break };
+        let page = first.page;
         let mut e = s + 1;
-        while e < end && words[e].page == page {
+        while e < end && words.get(e).is_some_and(|w| w.page == page) {
             e += 1;
         }
         runs.push((s, e));
@@ -305,13 +306,15 @@ pub fn compare(old: &[Word], new: &[Word]) -> Comparison {
             }
             k += 1;
         }
+        // Page runs from each side are paired positionally (`del_runs[r]` with `ins_runs[r]`);
+        // any trailing runs on the side that spans more pages become one-sided changes.
         let del_runs = page_runs(old, i0, i);
         let ins_runs = page_runs(new, j0, j);
         for r in 0..del_runs.len().max(ins_runs.len()) {
             let (ds, de) = del_runs.get(r).copied().unwrap_or((i, i));
             let (is, ie) = ins_runs.get(r).copied().unwrap_or((j, j));
-            let del: Vec<&Word> = old[ds..de].iter().collect();
-            let ins: Vec<&Word> = new[is..ie].iter().collect();
+            let del: Vec<&Word> = old.get(ds..de).into_iter().flatten().collect();
+            let ins: Vec<&Word> = new.get(is..ie).into_iter().flatten().collect();
             let kind = match (del.is_empty(), ins.is_empty()) {
                 (false, false) => Kind::Replaced,
                 (false, true) => Kind::Deleted,
@@ -451,6 +454,26 @@ mod tests {
         assert_eq!(c_shifted.changes.len(), 1);
         assert_eq!((c_shifted.changes[0].old.page, c_shifted.changes[0].new.page), (1, 0));
         assert_eq!(c_shifted.changes[0].new.near, Some(shifted_new[0].rect));
+
+        // A replacement crossing a page break on both sides pairs the page runs positionally,
+        // and any extra run on the longer side becomes a trailing one-sided change.
+        let rep_old = vec![
+            Word { text: "keep".into(), page: 0, rect: [10.0, 700.0, 45.0, 710.0] },
+            Word { text: "old0".into(), page: 0, rect: [50.0, 700.0, 85.0, 710.0] },
+            Word { text: "old1".into(), page: 1, rect: [10.0, 700.0, 45.0, 710.0] },
+            Word { text: "old2".into(), page: 2, rect: [10.0, 700.0, 45.0, 710.0] },
+            Word { text: "tail".into(), page: 2, rect: [50.0, 700.0, 85.0, 710.0] },
+        ];
+        let rep_new = vec![
+            Word { text: "keep".into(), page: 0, rect: [10.0, 700.0, 45.0, 710.0] },
+            Word { text: "new0".into(), page: 0, rect: [50.0, 700.0, 85.0, 710.0] },
+            Word { text: "new1".into(), page: 1, rect: [10.0, 700.0, 45.0, 710.0] },
+            Word { text: "tail".into(), page: 1, rect: [50.0, 700.0, 85.0, 710.0] },
+        ];
+        let c_rep = compare(&rep_old, &rep_new);
+        let got_rep: Vec<(Kind, usize, usize, &str, &str)> =
+            c_rep.changes.iter().map(|x| (x.kind, x.old.page, x.new.page, x.old.text.as_str(), x.new.text.as_str())).collect();
+        assert_eq!(got_rep, [(Kind::Replaced, 0, 0, "old0", "new0"), (Kind::Replaced, 1, 1, "old1", "new1"), (Kind::Deleted, 2, 1, "old2", "")]);
     }
 
     #[test]

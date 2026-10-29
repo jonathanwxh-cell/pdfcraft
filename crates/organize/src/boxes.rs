@@ -145,7 +145,7 @@ pub fn set_page_box(doc: &mut Document, pages: &[usize], which: PageBox, spec: B
         // pin the page's media box explicitly only when an ancestor still supplies a valid CropBox.
         let after = walk(doc)?;
         for &(i, page, _, media) in &plan {
-            if after.get(i).and_then(|(_, inh)| rect_of(inh.get(b"CropBox"), doc)).and_then(|c| clip(c, media)).is_some() {
+            if after.get(i).and_then(|(_, inh)| rect_of(inh.get(b"CropBox"), doc)).is_some() {
                 doc.update_dict(page, |d| d.set(b"CropBox".to_vec(), Object::Array(media.iter().map(|v| Object::Real(*v)).collect())))?;
             }
         }

@@ -2357,6 +2357,19 @@ fn page_boxes_remove_uninherited_crop_clip_disjoint_boxes_and_reject_overflow() 
     set_page_box(&mut d, &[0], PageBox::Crop, BoxSpec::Remove).unwrap();
     assert_eq!(page_boxes(&d).unwrap()[0][1], [0.0, 0.0, 300.0, 400.0]);
 
+    // An inherited /CropBox that is currently disjoint from the page's /MediaBox still causes removal to pin the MediaBox.
+    let mut d_disjoint_inh = open(build(
+        &[
+            "<< /Type /Catalog /Pages 2 0 R >>".into(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] /CropBox [350 350 450 450] >>".into(),
+            "<< /Type /Page /CropBox [40 40 260 360] >>".into(),
+        ],
+        "/Root 1 0 R",
+    ));
+    set_page_box(&mut d_disjoint_inh, &[0], PageBox::Crop, BoxSpec::Remove).unwrap();
+    set_page_box(&mut d_disjoint_inh, &[0], PageBox::Media, BoxSpec::Rect([0.0, 0.0, 500.0, 500.0])).unwrap();
+    assert_eq!(page_boxes(&d_disjoint_inh).unwrap()[0][1], [0.0, 0.0, 300.0, 400.0]);
+
     // Disjoint or zero-area boxes in a file fall back to MediaBox/CropBox instead of producing inverted rectangles.
     let disjoint = open(build(
         &[

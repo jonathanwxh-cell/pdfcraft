@@ -623,10 +623,10 @@ fn check_actions(doc: &Document, dict: &Dict, issue: &mut impl FnMut(&'static st
     }
 }
 
-/// Whether `dict` is an annotation dictionary (`/Type /Annot`, or a dictionary with `/Subtype`
-/// that either sits in a page's `/Annots` list or carries both `/Rect` and `/P`).
+/// Whether `dict` is an annotation dictionary (`/Type /Annot`, or a dictionary with the required
+/// `/Subtype` and `/Rect` entries that either sits in a page's `/Annots` list or carries `/P`).
 fn is_annotation(dict: &Dict, ty: Option<&[u8]>, subtype: Option<&[u8]>, on_page: bool) -> bool {
-    ty == Some(b"Annot") || (subtype.is_some() && (on_page || (dict.get(b"Rect").is_some() && dict.get(b"P").is_some())))
+    ty == Some(b"Annot") || (subtype.is_some() && dict.get(b"Rect").is_some() && (on_page || dict.get(b"P").is_some()))
 }
 
 fn check_annotation(

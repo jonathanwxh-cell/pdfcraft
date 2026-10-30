@@ -491,17 +491,20 @@ fn an_output_intent_profile_header_is_read_within_a_size_cap() {
 
 #[test]
 fn typeless_annotations_indexed_cmyk_and_indirect_filter_elements_are_handled() {
-    // Annotations in /Annots that omit optional /Type /Annot (and /P or /Rect), whether indirect or direct
-    // dictionaries, are still verified and fixed by convert.
+    // Annotations in /Annots that omit optional /Type /Annot and /P (while keeping required /Subtype
+    // and /Rect), whether indirect or direct dictionaries, are still verified and fixed by convert.
+    // A malformed /Annots dictionary without /Type /Annot and without /Rect is not treated as an
+    // annotation or destructively removed by convert.
     let mut doc = build(
         &[
             "<< /Type /Catalog /Pages 2 0 R >>",
             "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >>",
-            "<< /Type /Page /Parent 2 0 R /Annots [4 0 R 5 0 R 6 0 R << /Subtype /Movie >>] >>",
+            "<< /Type /Page /Parent 2 0 R /Annots [4 0 R 5 0 R 6 0 R 8 0 R << /Subtype /Movie /Rect [60 10 70 30] >> << /Subtype /Sound >>] >>",
             "<< /Subtype /Text /Rect [10 10 30 30] /P 3 0 R /AP << /N 7 0 R >> >>",
-            "<< /Subtype /Sound >>",
+            "<< /Subtype /Sound /Rect [50 10 60 30] >>",
             "<< /Subtype /Widget /FT /Tx /T (f) /Rect [70 10 90 30] /F 4 /AA << /E << /S /URI /URI (https://example.com) >> >> /AP << /N 7 0 R >> >>",
             "<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 0 >>\nstream\n\nendstream",
+            "<< /Subtype /Movie >>",
         ],
         "",
     );
@@ -514,6 +517,15 @@ fn typeless_annotations_indexed_cmyk_and_indirect_filter_elements_are_handled() 
     assert!(!msgs.contains(&"A form field has additional actions"), "{msgs:#?}");
     let r = convert(&mut doc, Level::A2b).unwrap();
     assert!(r.remaining.is_empty(), "{:#?}", r.remaining);
+    // The two /Rect-bearing forbidden annotations (5 0 R and the inline /Movie with /Rect) were
+    // removed, while the two /Rect-less dictionaries (8 0 R and inline << /Subtype /Sound >>)
+    // without /Type /Annot are left untouched rather than destructively stripped.
+    assert_eq!(&*doc.get(ObjRef::new(5, 0)), &Object::Null);
+    assert!(doc.get(ObjRef::new(8, 0)).as_dict().is_some());
+    let page_annots = doc.get(ObjRef::new(3, 0)).as_dict().and_then(|d| d.get(b"Annots")).and_then(Object::as_array).cloned().unwrap();
+    assert_eq!(page_annots.len(), 4, "{page_annots:#?}");
+    assert!(page_annots.iter().any(|entry| entry.as_ref() == Some(ObjRef::new(8, 0))));
+    assert!(page_annots.iter().any(|entry| entry.as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Sound") && d.get(b"Rect").is_none())));
 
     // Indexed and Separation colour spaces over DeviceCMYK on image XObjects or /ColorSpace resources count as CMYK.
     let indexed_img = build(

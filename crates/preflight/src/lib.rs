@@ -592,7 +592,7 @@ fn check_one_object(
     let ty = dict.name(b"Type");
     let subtype = dict.name(b"Subtype");
     check_actions(doc, dict, issue);
-    let is_annot = matches!(object, Object::Dict(_)) && is_annotation(dict, ty, subtype, page.is_some());
+    let is_annot = matches!(object, Object::Dict(_)) && is_annotation(doc, dict, ty, subtype, page.is_some());
     if is_annot && check_annotation(doc, dict, subtype, page, issue) {
         // A forbidden annotation stops every later check for its object, as the scan did before
         // it was split into helpers: the rest of its own checks and the form field, font, stream
@@ -624,9 +624,10 @@ fn check_actions(doc: &Document, dict: &Dict, issue: &mut impl FnMut(&'static st
 }
 
 /// Whether `dict` is an annotation dictionary (`/Type /Annot`, or a dictionary with the required
-/// `/Subtype` and `/Rect` entries that either sits in a page's `/Annots` list or carries `/P`).
-fn is_annotation(dict: &Dict, ty: Option<&[u8]>, subtype: Option<&[u8]>, on_page: bool) -> bool {
-    ty == Some(b"Annot") || (subtype.is_some() && dict.get(b"Rect").is_some() && (on_page || dict.get(b"P").is_some()))
+/// `/Subtype` and `/Rect` array entries that either sits in a page's `/Annots` list or carries `/P`).
+fn is_annotation(doc: &Document, dict: &Dict, ty: Option<&[u8]>, subtype: Option<&[u8]>, on_page: bool) -> bool {
+    ty == Some(b"Annot")
+        || (subtype.is_some() && dict.get(b"Rect").is_some_and(|r| doc.resolve(r).as_array().is_some()) && (on_page || dict.get(b"P").is_some()))
 }
 
 fn check_annotation(
@@ -904,7 +905,7 @@ fn convert_direct_page_annots(
         };
         let ty = nd.name(b"Type").map(<[u8]>::to_vec);
         let sub = nd.name(b"Subtype").map(<[u8]>::to_vec);
-        let is_annot = is_annotation(&nd, ty.as_deref(), sub.as_deref(), true);
+        let is_annot = is_annotation(doc, &nd, ty.as_deref(), sub.as_deref(), true);
         if is_annot && sub.as_deref().is_some_and(|s| FORBIDDEN_ANNOTS.contains(&s)) {
             *removed += 1;
             changed = true;
@@ -999,7 +1000,7 @@ pub fn convert(doc: &mut Document, level: Level) -> Result<Report, pdfcraft_cos:
         let Some(d) = dict_of(&o).cloned() else { continue };
         let ty = d.name(b"Type").map(<[u8]>::to_vec);
         let sub = d.name(b"Subtype").map(<[u8]>::to_vec);
-        let is_annot = matches!(&*o, Object::Dict(_)) && is_annotation(&d, ty.as_deref(), sub.as_deref(), page_annots.contains(&r));
+        let is_annot = matches!(&*o, Object::Dict(_)) && is_annotation(doc, &d, ty.as_deref(), sub.as_deref(), page_annots.contains(&r));
         if is_annot && sub.as_deref().is_some_and(|s| FORBIDDEN_ANNOTS.contains(&s)) {
             remove_annot_from_pages(doc, r)?;
             removed += 1;

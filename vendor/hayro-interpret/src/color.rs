@@ -391,6 +391,13 @@ impl ColorSpace {
         matches!(self.0.as_ref(), ColorSpaceType::DeviceGray)
     }
 
+    // PdfCraft patch (63).
+    /// Whether this is `/DeviceCMYK` itself, not an ICC-based or default colour space that
+    /// stands in for it.
+    pub(crate) fn is_device_cmyk(&self) -> bool {
+        matches!(self.0.as_ref(), ColorSpaceType::DeviceCmyk)
+    }
+
     /// Get the number of components of the color space.
     pub(crate) fn num_components(&self) -> u8 {
         match self.0.as_ref() {
@@ -1342,6 +1349,18 @@ fn f32_to_u8(val: f32) -> u8 {
     (val * 255.0 + 0.5) as u8
 }
 
+// PdfCraft patch (63).
+/// The `/DeviceCMYK` to `/DeviceGray` conversion of ISO 32000-2 §10.4.2.3,
+/// `gray = 1.0 - min(1.0, 0.3 c + 0.59 m + 0.11 y + k)`, which §11.5.3 also gives for the
+/// luminosity of a soft mask whose group is in `/DeviceCMYK`. A missing component counts as
+/// zero, and each component is clamped to `[0, 1]` first (`NaN` and infinities read as zero).
+pub(crate) fn device_cmyk_to_gray(cmyk: &[f32]) -> f32 {
+    let component = |i: usize| clamp_component(cmyk.get(i).copied().unwrap_or(0.0), 0.0, 1.0);
+    let ink = 0.3 * component(0) + 0.59 * component(1) + 0.11 * component(2) + component(3);
+    // Every component is in [0, 1], so `ink` is not negative and the result is in [0, 1].
+    1.0 - ink.min(1.0)
+}
+
 /// Clamp an input-derived colour component to `[lo, hi]` without panicking on
 /// NaN or on a reversed range. Non-finite values map to zero.
 fn clamp_component(value: f32, lo: f32, hi: f32) -> f32 {
@@ -1380,6 +1399,29 @@ impl Color {
             .to_rgba(&self.components, self.opacity, false)
     }
 
+    /// PdfCraft patch (70): the colour as process ink tints `[C, M, Y, K]` (0 = no ink) and
+    /// its opacity, for blending in a `DeviceCMYK` transparency group (ISO 32000-2 §11.3.4).
+    ///
+    /// `DeviceCMYK` gives its components. `DeviceGray` is black ink alone, `K = 1 − gray`
+    /// (§10.4.2.2). `None` for every other space, ICCBased CMYK included: such a colour has no
+    /// tints without a colour conversion this crate does not make (an ICCBased colour keeps
+    /// its own profile), and the caller draws it as before.
+    pub fn ink_tints(&self) -> Option<([f32; 4], f32)> {
+        let c = |i: usize| {
+            self.components
+                .get(i)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0)
+        };
+        let tints = match self.color_space.0.as_ref() {
+            ColorSpaceType::DeviceCmyk => [c(0), c(1), c(2), c(3)],
+            ColorSpaceType::DeviceGray => [0.0, 0.0, 0.0, 1.0 - c(0)],
+            _ => return None,
+        };
+        Some((tints, self.opacity.clamp(0.0, 1.0)))
+    }
+
     /// Create a color from RGBA.
     pub fn from_rgba(rgba: AlphaColor) -> Self {
         let c = rgba.components();
@@ -1389,6 +1431,16 @@ impl Color {
             opacity: c[3],
         }
     }
+}
+
+/// PdfCraft patch (70): `input`, 8-bit `DeviceCMYK` pixels (four bytes each), converted to
+/// 8-bit sRGB in `output` (three bytes each) through the CMYK profile pages are drawn with,
+/// so a colour blended in CMYK lands where the same colour painted directly does.
+pub fn cmyk_to_srgb8(input: &[u8], output: &mut [u8]) -> Option<()> {
+    if input.len() % 4 != 0 || output.len() != input.len() / 4 * 3 {
+        return None;
+    }
+    CMYK_TRANSFORM.convert_u8(input, output)
 }
 
 static CMYK_TRANSFORM: LazyLock<ICCProfile> = LazyLock::new(|| {
@@ -1448,5 +1500,38 @@ pub(crate) trait ToRgb {
             output[2],
             (opacity * 255.0 + 0.5) as u8,
         ))
+    }
+}
+
+#[cfg(test)]
+mod device_cmyk_gray_tests {
+    use super::device_cmyk_to_gray;
+
+    fn assert_close(cmyk: &[f32], expected: f32) {
+        let got = device_cmyk_to_gray(cmyk);
+        assert!(
+            (got - expected).abs() < 1e-5,
+            "{cmyk:?}: gray {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn each_ink_darkens_by_its_iso_weight() {
+        assert_close(&[0.0, 0.0, 0.0, 0.0], 1.0);
+        assert_close(&[0.0, 0.0, 0.0, 1.0], 0.0);
+        assert_close(&[0.0, 0.0, 0.0, 0.5], 0.5);
+        assert_close(&[1.0, 0.0, 0.0, 0.0], 0.7);
+        assert_close(&[0.0, 1.0, 0.0, 0.0], 0.41);
+        assert_close(&[0.0, 0.0, 1.0, 0.0], 0.89);
+        assert_close(&[0.5, 0.5, 0.5, 0.25], 0.25);
+    }
+
+    #[test]
+    fn ink_past_full_coverage_is_black_and_bad_components_read_as_zero() {
+        assert_close(&[1.0, 1.0, 1.0, 1.0], 0.0);
+        assert_close(&[0.0, 0.0, 0.0, 1.5], 0.0);
+        assert_close(&[2.0, -1.0, f32::NAN, f32::INFINITY], 0.7);
+        assert_close(&[], 1.0);
+        assert_close(&[0.0, 0.0], 1.0);
     }
 }

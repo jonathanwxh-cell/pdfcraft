@@ -3061,6 +3061,26 @@ fn signed_catalog_and_page_tree_keep_their_role_when_relabelled_or_dropped() {
             ])),
         );
     });
+
+    // Rewriting a signed non-form dictionary (such as an `/Action` dictionary) by adding `/FT /Tx`
+    // or `/DR` in a later revision is classified as `kind::OTHER` rather than `kind::FORM_FILL`,
+    // and is refused even under DocMDP `P = 2` (and `P = 3`).
+    let with_action = fixture_with(
+        b"<< /Type /Catalog /Pages 2 0 R /OpenAction 7 0 R /AcroForm << /Fields [6 0 R] >> >>",
+        &[b"<< /Type /Action /S /URI /URI (https://example.test/signed) >>"],
+    );
+    assert_refused_at_every_level(&with_action, kind::OTHER, |doc| {
+        doc.set(
+            ObjRef { num: 7, generation: 0 },
+            Object::Dict(dict_of(vec![
+                ("Type", Object::name("Action")),
+                ("S", Object::name("URI")),
+                ("URI", Object::String(PdfString::text("https://attacker.invalid/phish"))),
+                ("FT", Object::name("Tx")),
+                ("DR", Object::Dict(Dict::new())),
+            ])),
+        );
+    });
 }
 
 /// Signature dictionaries (`/ByteRange`, `/Contents`, `/Reference`) are read from the revision

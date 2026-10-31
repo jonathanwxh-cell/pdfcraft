@@ -147,6 +147,23 @@ impl DefaultOc {
         Self { ocgs, hidden }
     }
 
+    /// Reads the default optional-content configuration from `doc` and applies live layer overrides `(num, gen, visible)`.
+    fn from_doc_with_layers(doc: &Document, layers: &[(i32, i32, bool)]) -> Self {
+        let mut oc = Self::from_doc(doc);
+        for &(num, generation, visible) in layers {
+            if let (Ok(num), Ok(generation)) = (u32::try_from(num), u16::try_from(generation)) {
+                let r = ObjRef::new(num, generation);
+                oc.ocgs.insert(r);
+                if visible {
+                    oc.hidden.remove(&r);
+                } else {
+                    oc.hidden.insert(r);
+                }
+            }
+        }
+        oc
+    }
+
     /// Whether `r` is an optional-content group in the document.
     fn is_ocg(&self, doc: &Document, r: ObjRef) -> bool {
         self.ocgs.contains(&r) || doc.get(r).as_dict().is_some_and(|d| d.name(b"Type") == Some(b"OCG"))
@@ -382,10 +399,15 @@ impl ImageState {
 /// The images and Form artwork page `page` (0-based) draws, in drawing order.
 /// Forms stay intact: no traversal or rewriting of their internal objects is needed.
 pub fn page_images(doc: &Document, page: usize) -> Result<Vec<PageImage>, EditError> {
+    page_images_with_layers(doc, page, &[])
+}
+
+/// [`page_images`] evaluated with live layer overrides `(num, gen, visible)` on top of `/OCProperties /D`.
+pub fn page_images_with_layers(doc: &Document, page: usize, layers: &[(i32, i32, bool)]) -> Result<Vec<PageImage>, EditError> {
     let p = page_of(doc, page)?;
     let xo = xobjects(doc, &p.dict);
     let props = properties(doc, &p.dict);
-    let oc = DefaultOc::from_doc(doc);
+    let oc = DefaultOc::from_doc_with_layers(doc, layers);
     let mut oc_stack: Vec<bool> = Vec::new();
     let mut out = Vec::new();
     // The streams are one stream in pieces, so the graphics state and operators carry over.
@@ -655,7 +677,18 @@ fn clip_matrix(draw: Matrix, cm: Matrix, t: Matrix) -> Option<Matrix> {
 
 /// Change image `index` (from [`page_images`]) on `page`.
 pub fn change_image(doc: &mut Document, page: usize, index: usize, change: &ImageChange) -> Result<(), EditError> {
-    let images = page_images(doc, page)?;
+    change_image_with_layers(doc, page, index, change, &[])
+}
+
+/// [`change_image`] evaluated with live layer overrides `(num, gen, visible)` on top of `/OCProperties /D`.
+pub fn change_image_with_layers(
+    doc: &mut Document,
+    page: usize,
+    index: usize,
+    change: &ImageChange,
+    layers: &[(i32, i32, bool)],
+) -> Result<(), EditError> {
+    let images = page_images_with_layers(doc, page, layers)?;
     let img = images.get(index).cloned().ok_or_else(|| EditError::Invalid(format!("page {} has no image {}", page + 1, index + 1)))?;
     let p = page_of(doc, page)?;
     let all = content_streams(doc, &p.dict)?;
@@ -704,10 +737,11 @@ pub(crate) fn selectable_images(
     doc: &Document,
     page: usize,
     excluded: &std::collections::BTreeSet<ObjRef>,
+    layers: &[(i32, i32, bool)],
 ) -> Result<Vec<(usize, PageImage)>, EditError> {
     let p = page_of(doc, page)?;
     let all = content_streams(doc, &p.dict)?;
-    Ok(page_images(doc, page)?
+    Ok(page_images_with_layers(doc, page, layers)?
         .into_iter()
         .enumerate()
         .filter(|(_, image)| !all.get(image.stream).and_then(|(o, _)| o.as_ref()).is_some_and(|r| excluded.contains(&r)))
@@ -924,11 +958,22 @@ fn crop_image(
 
 /// Plan all transforms before changing a stream; indexes refer to the original inventory.
 /// Splice only the chosen Do operators and preserve all other bytes and stream dictionaries.
+#[cfg(test)]
 pub(crate) fn translate_images(doc: &mut Document, page: usize, indexes: &[usize], offset: [f64; 2]) -> Result<(), EditError> {
+    translate_images_with_layers(doc, page, indexes, offset, &[])
+}
+
+pub(crate) fn translate_images_with_layers(
+    doc: &mut Document,
+    page: usize,
+    indexes: &[usize],
+    offset: [f64; 2],
+    layers: &[(i32, i32, bool)],
+) -> Result<(), EditError> {
     if indexes.is_empty() {
         return Ok(());
     }
-    let images = page_images(doc, page)?;
+    let images = page_images_with_layers(doc, page, layers)?;
     let p = page_of(doc, page)?;
     let all = content_streams(doc, &p.dict)?;
     let mut plans = std::collections::BTreeMap::new();
@@ -1118,5 +1163,11 @@ mod tests {
         assert_eq!(listed[0].name, "Im1");
         change_image(&mut two_imgs, 0, 0, &ImageChange::Delete).unwrap();
         assert!(page_images(&two_imgs, 0).unwrap().is_empty(), "deleting index 0 removes the visible image");
+        // Revealing the hidden layer via live layer overrides exposes Im0 for listing and editing.
+        let revealed = page_images_with_layers(&two_imgs, 0, &[(5, 0, true)]).unwrap();
+        assert_eq!(revealed.len(), 1);
+        assert_eq!(revealed[0].name, "Im0");
+        change_image_with_layers(&mut two_imgs, 0, 0, &ImageChange::Delete, &[(5, 0, true)]).unwrap();
+        assert!(page_images_with_layers(&two_imgs, 0, &[(5, 0, true)]).unwrap().is_empty());
     }
 }

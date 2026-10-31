@@ -540,14 +540,14 @@ impl Document {
 
     /// Edit a PDF: the images `page` draws (0-based).
     pub fn page_images(&self, page: usize) -> Vec<pdfcraft_edit::PageImage> {
-        self.editor.as_ref().and_then(|e| pdfcraft_edit::page_images(&e.cos, page).ok()).unwrap_or_default()
+        self.editor.as_ref().and_then(|e| pdfcraft_edit::page_images_with_layers(&e.cos, page, &self.config.layers).ok()).unwrap_or_default()
     }
 
     /// Mixed editable objects on one page. Source inventories are zero-based and added items
     /// appear once. Rectangles are user-space points, independent of the viewer's zoom.
     pub fn editable_objects(&self, page: usize) -> Result<Vec<EditableObject>, String> {
         let editor = self.editor.as_ref().ok_or("the document can't be read")?;
-        pdfcraft_edit::editable_objects(&editor.cos, page).map_err(|e| e.to_string())
+        pdfcraft_edit::editable_objects_with_layers(&editor.cos, page, &self.config.layers).map_err(|e| e.to_string())
     }
 
     /// Displayed top-left-origin motion to a user-space vector. Use the linear map only,
@@ -1124,6 +1124,10 @@ fn use_layer_choices(doc: &mut Document) {
     let overrides: Vec<(i32, i32, bool)> = doc.info.layers.iter().map(|l| (l.id.0 as i32, l.id.1 as i32, l.visible)).collect();
     doc.config.layers = Arc::new(overrides);
     doc.renderer = RenderPool::new(doc.display.clone(), render_threads(), doc.config.clone());
+    if doc.snapshot_generation == doc.generation {
+        doc.snapshot_generation += 1;
+    }
+    doc.generation += 1;
 }
 
 /// Apply a set-layer-visibility action to `layers`, one change at a time, so a toggle flips the
@@ -2476,6 +2480,8 @@ struct EditCtx {
     /// The overlay streams the edit's applied redactions added, which alone the renderer's check
     /// leaves out.
     redaction_overlays: Vec<pdfcraft_cos::ObjRef>,
+    /// Live optional-content layer overrides `(num, gen, visible)` active in the session.
+    layers: Arc<Vec<(i32, i32, bool)>>,
 }
 
 impl EditCtx {
@@ -2503,6 +2509,7 @@ impl EditCtx {
             count: 0,
             renamed_fields: Vec::new(),
             redaction_overlays: Vec::new(),
+            layers: Arc::new(Vec::new()),
         }
     }
 
@@ -2779,7 +2786,7 @@ fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) -> 
             pdfcraft_edit::stamp(doc, *page, "OCR", pdfcraft_ocr::text_layer(words))?;
         }
         Edit::EditPageImage { page, index, change } => {
-            let img = pdfcraft_edit::page_images(doc, *page)?
+            let img = pdfcraft_edit::page_images_with_layers(doc, *page, &cx.layers)?
                 .into_iter()
                 .nth(*index)
                 .ok_or_else(|| EditError::Edit(pdfcraft_edit::EditError::Invalid(format!("page {} has no image {}", page + 1, index + 1))))?;
@@ -2810,9 +2817,9 @@ fn run_edit(doc: &mut pdfcraft_cos::Document, edit: &Edit, cx: &mut EditCtx) -> 
                 ImageEdit::Crop(keep) => pdfcraft_edit::ImageChange::Crop(*keep),
                 ImageEdit::Delete => pdfcraft_edit::ImageChange::Delete,
             };
-            pdfcraft_edit::change_image(doc, *page, *index, &c)?;
+            pdfcraft_edit::change_image_with_layers(doc, *page, *index, &c, &cx.layers)?;
         }
-        Edit::MoveObjects { page, objects, offset } => pdfcraft_edit::move_objects(doc, *page, objects, *offset)?,
+        Edit::MoveObjects { page, objects, offset } => pdfcraft_edit::move_objects_with_layers(doc, *page, objects, *offset, &cx.layers)?,
         Edit::EditTextBlock { page, block, text, style } => {
             pdfcraft_edit::rewrite_block(doc, *page, *block, Some(text), style)?;
         }
@@ -3965,6 +3972,7 @@ impl Session {
         }
         cx.pages = doc.info.pages.len();
         cx.today = today;
+        cx.layers = doc.config.layers.clone();
         let reason = doc.read_only_reason.clone().unwrap_or_default();
         let signed = doc.is_signed();
         let editor = doc.editor.as_mut().ok_or(EditError::ReadOnly(reason))?;

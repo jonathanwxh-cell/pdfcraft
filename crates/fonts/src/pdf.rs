@@ -1568,4 +1568,15 @@ mod encoding_tests {
         }
         assert_eq!(budget.remaining(), 0);
     }
+
+    #[test]
+    fn named_glyphless_ocr_fonts_are_recognised_without_a_shared_gid_map() {
+        for base in ["GlyphlessFont", "ABCDEF+Glyphless", "HiddenHorzOCR", "ABCDEF+HiddenVertOCR"] {
+            let (doc, d) = simple(base, None, Some(Object::name("WinAnsiEncoding")));
+            let m = Metrics::from_dict(&doc, &d);
+            assert!(m.glyphless && is_glyphless(&doc, &d), "{base} must be marked glyphless by name alone");
+            assert!(!m.has_glyph(b'A'.into()), "{base} must not claim visible glyph outlines");
+            assert!(m.encode("A").is_none(), "{base} must not encode replacement text");
+        }
+    }
 }

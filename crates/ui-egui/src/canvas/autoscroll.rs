@@ -17,9 +17,10 @@ const MAX_DISPLACEMENT: f32 = 1_000_000.0;
 pub(crate) struct AutoScroll {
     anchor: Option<Pos2>,
     organize: bool,
-    /// Consecutive or total frames spent past [`DEAD_ZONE`] while the initiating middle press
-    /// remained held (`>= 2` distinguishes a held scroll from a quick click).
-    held_frames_past_dead_zone: u8,
+    /// Whether the initiating middle press is still physically held (not yet released).
+    button_held: bool,
+    /// Whether the pointer moved past [`DEAD_ZONE`] while the initiating middle press was held.
+    held_past_dead_zone: bool,
     /// Own a cancelling click through its release, so it cannot also edit page content.
     cancel_button: Option<PointerButton>,
     block_input: bool,
@@ -28,6 +29,7 @@ pub(crate) struct AutoScroll {
 }
 
 impl AutoScroll {
+    /// Whether latched auto-scroll is currently active.
     pub(crate) fn active(&self) -> bool {
         self.anchor.is_some()
     }
@@ -37,14 +39,17 @@ impl AutoScroll {
         self.drag.is_some()
     }
 
+    /// Clear any active auto-scroll latch, held pan, or input-blocking state.
     pub(crate) fn cancel(&mut self) {
         self.anchor = None;
-        self.held_frames_past_dead_zone = 0;
+        self.button_held = false;
+        self.held_past_dead_zone = false;
         self.drag = None;
         self.cancel_button = None;
         self.block_input = false;
     }
 
+    /// Whether page tools and selection should ignore pointer input this frame.
     pub(crate) fn blocks_input(&self) -> bool {
         self.block_input
     }
@@ -56,11 +61,13 @@ impl AutoScroll {
         self.update_for_platform(ui, viewport, organize, cfg!(target_os = "linux"), invert)
     }
 
+    /// Dispatch middle-button input to latched auto-scroll (`supported`) or 1:1 drag panning.
     fn update_for_platform(&mut self, ui: &egui::Ui, viewport: egui::Rect, organize: bool, supported: bool, invert: bool) -> Vec2 {
         let delta = if supported { self.update_latched(ui, viewport, organize) } else { self.update_drag(ui, viewport) };
         oriented(delta, invert)
     }
 
+    /// Advance Linux-style latched auto-scroll and held middle-drag cancellation for one frame.
     fn update_latched(&mut self, ui: &egui::Ui, viewport: egui::Rect, organize: bool) -> Vec2 {
         let ctx = ui.ctx();
         let (pointer, middle_press, middle_down, middle_released, has_release_event, cancel, cancel_button, dt) = ctx.input(|i| {
@@ -112,19 +119,23 @@ impl AutoScroll {
             {
                 self.anchor = Some(pressed_at);
                 self.organize = organize;
-                self.held_frames_past_dead_zone = 0;
+                self.button_held = true;
+                self.held_past_dead_zone = false;
             }
         }
         let (Some(anchor), Some(pointer)) = (self.anchor, pointer) else { return Vec2::ZERO };
         let displacement = pointer.y - anchor.y;
         let past_dead_zone = displacement.is_finite() && displacement.abs() > DEAD_ZONE;
-        if middle_down && !has_release_event && past_dead_zone {
-            self.held_frames_past_dead_zone = self.held_frames_past_dead_zone.saturating_add(1);
+        if self.button_held && ctx.input(|i| held_past_dead_zone_in_frame(&i.events, anchor, pointer, middle_press.is_some())) {
+            self.held_past_dead_zone = true;
         }
-        if (middle_released || has_release_event) && self.held_frames_past_dead_zone >= 2 {
-            self.cancel();
-            self.block_input = true;
-            return Vec2::ZERO;
+        if middle_released || has_release_event {
+            self.button_held = false;
+            if self.held_past_dead_zone {
+                self.cancel();
+                self.block_input = true;
+                return Vec2::ZERO;
+            }
         }
         // Cap the elapsed time too: returning from an idle/hidden window must never jump pages.
         let delta = scroll_delta(displacement, dt);
@@ -140,7 +151,8 @@ impl AutoScroll {
     /// blocked from the press through the release, so the drag cannot also draw, select or move.
     fn update_drag(&mut self, ui: &egui::Ui, viewport: egui::Rect) -> Vec2 {
         self.anchor = None;
-        self.held_frames_past_dead_zone = 0;
+        self.button_held = false;
+        self.held_past_dead_zone = false;
         self.cancel_button = None;
         let ctx = ui.ctx();
         let (pointer, middle_press, middle_down, middle_released, focused) = ctx.input(|i| {
@@ -257,11 +269,39 @@ pub(crate) fn edge_delta(y: f32, viewport: egui::Rect, dt: f32) -> f32 {
     -distance.clamp(-MAX_DISPLACEMENT, MAX_DISPLACEMENT) * EDGE_SPEED * dt.clamp(0.0, 0.05)
 }
 
+/// Whether the pointer moved past [`DEAD_ZONE`] from `anchor` while the middle button was held
+/// during this frame.
+///
+/// Events are inspected in order across both held and release frames so an excursion past
+/// [`DEAD_ZONE`] is recorded even if the pointer returns inside the dead zone before release, and
+/// pointer motion after a release event does not count as held movement.
+fn held_past_dead_zone_in_frame(events: &[Event], anchor: Pos2, pointer: Pos2, pressed_this_frame: bool) -> bool {
+    let outside = |pos: Pos2| {
+        let d = pos - anchor;
+        d.is_finite() && (d.x.abs() > DEAD_ZONE || d.y.abs() > DEAD_ZONE)
+    };
+    let mut held = !pressed_this_frame;
+    for event in events {
+        match *event {
+            Event::PointerButton { button: PointerButton::Middle, pressed: true, .. } => {
+                held = true;
+            }
+            Event::PointerMoved(pos) if held && outside(pos) => return true,
+            Event::PointerButton { pos, button: PointerButton::Middle, pressed: false, .. } => {
+                return held && outside(pos);
+            }
+            _ => {}
+        }
+    }
+    held && outside(pointer)
+}
+
 /// The middle button's delta, reversed when the user inverted it.
 fn oriented(delta: Vec2, invert: bool) -> Vec2 {
     if invert { -delta } else { delta }
 }
 
+/// Compute the vertical content scroll delta for `displacement` from the anchor over `dt` seconds.
 fn scroll_delta(displacement: f32, dt: f32) -> f32 {
     if !displacement.is_finite() || !dt.is_finite() {
         return 0.0;
@@ -347,12 +387,10 @@ mod tests {
             assert!(s.active() && s.blocks_input());
             assert_eq!(d, Vec2::ZERO);
         });
-        for _ in 0..2 {
-            frame(&ctx, &mut scroll, vec![Event::PointerMoved(far)], true, (true, false), |s, d| {
-                assert!(s.active() && s.blocks_input());
-                assert!(d.y < 0.0, "holding and moving past the dead zone scrolls: {d:?}");
-            });
-        }
+        frame(&ctx, &mut scroll, vec![Event::PointerMoved(far)], true, (true, false), |s, d| {
+            assert!(s.active() && s.blocks_input());
+            assert!(d.y < 0.0, "holding and moving past the dead zone scrolls: {d:?}");
+        });
         // Primary case: releasing while still past the dead zone stops auto-scroll immediately.
         frame(&ctx, &mut scroll, vec![middle(far, false)], true, (true, false), |s, d| {
             assert!(!s.active(), "releasing at +60pt after holding must turn auto-scroll off");
@@ -364,11 +402,17 @@ mod tests {
             assert_eq!(d, Vec2::ZERO);
         });
 
+        // Moving past the dead zone and releasing in the same frame (after pressing earlier) also stops.
+        frame(&ctx, &mut scroll, vec![Event::PointerMoved(p), middle(p, true)], true, (true, false), |s, _| assert!(s.active()));
+        frame(&ctx, &mut scroll, vec![Event::PointerMoved(far), middle(far, false)], true, (true, false), |s, d| {
+            assert!(!s.active(), "moving past the dead zone before release in the same frame cancels");
+            assert!(s.blocks_input());
+            assert_eq!(d, Vec2::ZERO);
+        });
+
         // Returning inside the dead zone before releasing still counts as a held scroll gesture.
         frame(&ctx, &mut scroll, vec![Event::PointerMoved(p), middle(p, true)], true, (true, false), |s, _| assert!(s.active()));
-        for _ in 0..2 {
-            frame(&ctx, &mut scroll, vec![Event::PointerMoved(far)], true, (true, false), |s, d| assert!(s.active() && d.y < 0.0));
-        }
+        frame(&ctx, &mut scroll, vec![Event::PointerMoved(far)], true, (true, false), |s, d| assert!(s.active() && d.y < 0.0));
         frame(&ctx, &mut scroll, vec![Event::PointerMoved(p + vec2(0.0, 5.0)), middle(p + vec2(0.0, 5.0), false)], true, (true, false), |s, d| {
             assert!(!s.active(), "releasing after scrolling while held must turn auto-scroll off");
             assert!(s.blocks_input());
@@ -401,25 +445,16 @@ mod tests {
         });
         scroll.cancel();
 
-        // Pointer movement after middle-button release in the same frame does not count as held movement.
-        frame(&ctx, &mut scroll, vec![Event::PointerMoved(p), middle(p, true)], true, (true, false), |s, _| assert!(s.active()));
-        frame(&ctx, &mut scroll, vec![middle(p, false), Event::PointerMoved(far)], true, (true, false), |s, d| {
-            assert!(s.active(), "movement after release in the same frame keeps auto-scroll latched");
-            assert!(d.y < 0.0);
-        });
-        scroll.cancel();
-
-        // A press, move, and release arriving in a single frame is a click at the initial press position,
-        // and stays latched across subsequent frames when egui delivers its deferred button_released state
-        // or runs multiple layout passes within the activation frame.
+        // Pointer movement after middle-button release in the same frame does not count as held movement,
+        // and deferred button_released in the next frame keeps auto-scroll latched.
         frame(
             &ctx,
             &mut scroll,
-            vec![Event::PointerMoved(p), middle(p, true), Event::PointerMoved(far), middle(far, false)],
+            vec![Event::PointerMoved(p), middle(p, true), middle(p, false), Event::PointerMoved(far)],
             true,
             (true, false),
             |s, d| {
-                assert!(s.active(), "single-frame click and move latches auto-scroll");
+                assert!(s.active(), "movement after release in the same frame keeps auto-scroll latched");
                 assert!(d.y < 0.0);
             },
         );
@@ -427,9 +462,29 @@ mod tests {
             assert!(s.active(), "deferred button_released in the next frame must keep auto-scroll latched");
             assert!(d.y < 0.0);
         });
+        scroll.cancel();
+
+        // A press, move past the dead zone, and release arriving in a single frame is a held drag
+        // that turns auto-scroll off on release while still blocking page tools for that frame.
+        frame(
+            &ctx,
+            &mut scroll,
+            vec![Event::PointerMoved(p), middle(p, true), Event::PointerMoved(far), middle(far, false)],
+            true,
+            (true, false),
+            |s, d| {
+                assert!(!s.active(), "single-frame held movement past dead zone cancels on release");
+                assert!(s.blocks_input());
+                assert_eq!(d, Vec2::ZERO);
+            },
+        );
         frame(&ctx, &mut scroll, vec![], true, (true, false), |s, d| {
-            assert!(s.active(), "subsequent frames after deferred release must keep auto-scroll latched");
-            assert!(d.y < 0.0);
+            assert!(!s.active(), "deferred button_released in the next frame leaves auto-scroll inactive");
+            assert_eq!(d, Vec2::ZERO);
+        });
+        frame(&ctx, &mut scroll, vec![], true, (true, false), |s, d| {
+            assert!(!s.active() && !s.blocks_input(), "subsequent frames after deferred release stay inactive");
+            assert_eq!(d, Vec2::ZERO);
         });
     }
 

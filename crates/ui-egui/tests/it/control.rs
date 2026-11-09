@@ -693,8 +693,8 @@ fn autoscroll_uses_the_initial_click_position_when_input_arrives_in_one_frame() 
     let top = h.state().views[0].page_screen_rect(0).unwrap().top();
     h.event(egui::Event::PointerMoved(p));
     h.event(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Middle, pressed: true, modifiers: egui::Modifiers::NONE });
+    h.event(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Middle, pressed: false, modifiers: egui::Modifiers::NONE });
     h.event(egui::Event::PointerMoved(moved));
-    h.event(egui::Event::PointerButton { pos: moved, button: egui::PointerButton::Middle, pressed: false, modifiers: egui::Modifiers::NONE });
     h.run_steps(8);
     assert!(h.state().views[0].auto_scrolling());
     assert!(h.state().views[0].page_screen_rect(0).unwrap().top() < top - 20.0, "distance is measured from the click, not the last mouse event");

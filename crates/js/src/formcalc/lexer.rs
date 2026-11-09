@@ -206,3 +206,32 @@ fn lex_number(chars: &[char], i: &mut usize, line: usize) -> Result<f64, String>
     let text: String = chars[start..*i].iter().collect();
     text.parse().map_err(|_| format!("line {line}: bad number {text}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lex_string_handles_doubled_quotes_unterminated_and_max_string_limit() {
+        assert_eq!(
+            lex(r#""say ""hello""""#),
+            Ok(vec![
+                Token { tok: Tok::Str(r#"say "hello""#.into()), line: 1 },
+                Token { tok: Tok::Newline, line: 1 },
+                Token { tok: Tok::Eof, line: 1 }
+            ])
+        );
+        assert!(lex(r#""unterminated"#).is_err());
+
+        let exact = format!("\"{}\"", "a".repeat(MAX_STRING));
+        assert!(lex(&exact).is_ok());
+
+        let over = format!("\"{}a\"", "a".repeat(MAX_STRING));
+        assert!(lex(&over).is_err());
+
+        // A multi-byte decoded \uXXXX escape that pushes the UTF-8 byte length past MAX_STRING is rejected.
+        let near = "a".repeat(MAX_STRING - 1);
+        let over_via_escape = format!("\"{near}\\u20ac\"");
+        assert!(lex(&over_via_escape).is_err());
+    }
+}

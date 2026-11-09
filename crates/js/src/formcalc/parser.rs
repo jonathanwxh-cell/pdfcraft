@@ -453,9 +453,14 @@ mod tests {
 
     #[test]
     fn unary_not_does_not_swallow_following_bang() {
-        assert_eq!(parse("not !1"), Ok(vec![Stmt::Expr(Expr::Not(Box::new(Expr::Not(Box::new(Expr::Num(1.0))))))]));
-        assert_eq!(parse("not !flag"), Ok(vec![Stmt::Expr(Expr::Not(Box::new(Expr::Not(Box::new(Expr::Ident("flag".into()))))))]));
-        assert_eq!(parse("!!1"), Ok(vec![Stmt::Expr(Expr::Not(Box::new(Expr::Not(Box::new(Expr::Num(1.0))))))]));
+        let double_not = |e| Ok(vec![Stmt::Expr(Expr::Not(Box::new(Expr::Not(Box::new(e)))))]);
+        let triple_not = |e| Ok(vec![Stmt::Expr(Expr::Not(Box::new(Expr::Not(Box::new(Expr::Not(Box::new(e)))))))]);
+        assert_eq!(parse("not !1"), double_not(Expr::Num(1.0)));
+        assert_eq!(parse("!not 1"), double_not(Expr::Num(1.0)));
+        assert_eq!(parse("not not 1"), double_not(Expr::Num(1.0)));
+        assert_eq!(parse("not !not 1"), triple_not(Expr::Num(1.0)));
+        assert_eq!(parse("not !flag"), double_not(Expr::Ident("flag".into())));
+        assert_eq!(parse("!!1"), double_not(Expr::Num(1.0)));
     }
 
     #[test]
@@ -463,14 +468,32 @@ mod tests {
         assert_eq!(parse(r#""\u0041\u20ac\U00000042\U0001F600""#), Ok(vec![Stmt::Expr(Expr::Str("A\u{20ac}B\u{1F600}".into()))]));
         assert_eq!(parse(r#""\uD83D\uDE00""#), Ok(vec![Stmt::Expr(Expr::Str("\u{1F600}".into()))]));
         assert_eq!(parse(r#""C:\temp\new\u12""#), Ok(vec![Stmt::Expr(Expr::Str(r"C:\temp\new\u12".into()))]));
+        // Lone surrogates and out-of-range escapes stay literal rather than decoding or erroring.
+        for literal in [r"\uD83D", r"\uDE00", r"\U00110000", r"\U0000D800"] {
+            assert_eq!(parse(&format!("\"{literal}\"")), Ok(vec![Stmt::Expr(Expr::Str(literal.into()))]));
+        }
+        assert_eq!(parse(r#""\uD83D\u0041""#), Ok(vec![Stmt::Expr(Expr::Str(r"\uD83DA".into()))]));
+        // Incomplete or non-hex escapes and trailing backslashes stay literal.
+        for literal in [r"\u12G4", r"\u123", r"\U0000004", r"\"] {
+            assert_eq!(parse(&format!("\"{literal}\"")), Ok(vec![Stmt::Expr(Expr::Str(literal.into()))]));
+        }
     }
 
     #[test]
     fn number_literals_stop_before_second_dot_for_member_access() {
         assert_eq!(parse("1.5.rawValue"), Ok(vec![Stmt::Expr(Expr::Member(Box::new(Expr::Num(1.5)), "rawValue".into()))]));
+        assert_eq!(parse(".5.rawValue"), Ok(vec![Stmt::Expr(Expr::Member(Box::new(Expr::Num(0.5)), "rawValue".into()))]));
         assert_eq!(parse("1.rawValue"), Ok(vec![Stmt::Expr(Expr::Member(Box::new(Expr::Num(1.0)), "rawValue".into()))]));
+        assert_eq!(parse("1.5e2.rawValue"), Ok(vec![Stmt::Expr(Expr::Member(Box::new(Expr::Num(150.0)), "rawValue".into()))]));
         assert_eq!(parse("1.e2foo"), Ok(vec![Stmt::Expr(Expr::Member(Box::new(Expr::Num(1.0)), "e2foo".into()))]));
         assert_eq!(parse("1.e2"), Ok(vec![Stmt::Expr(Expr::Num(100.0))]));
-        assert!(parse("1.2.3").is_err(), "a second decimal point followed by digits is a bad number");
+        assert_eq!(parse("1..rawValue"), Ok(vec![Stmt::Expr(Expr::Descend(Box::new(Expr::Num(1.0)), "rawValue".into()))]));
+        // Non-exponent suffixes leave the number at `1` and lex the suffix separately.
+        assert_eq!(parse("1e"), Ok(vec![Stmt::Expr(Expr::Num(1.0)), Stmt::Expr(Expr::Ident("e".into()))]));
+        assert_eq!(parse("1e2foo"), Ok(vec![Stmt::Expr(Expr::Num(1.0)), Stmt::Expr(Expr::Ident("e2foo".into()))]));
+        assert_eq!(parse("1e2.5"), Ok(vec![Stmt::Expr(Expr::Num(100.0)), Stmt::Expr(Expr::Num(0.5))]));
+        for invalid in ["1.2.3", "1.2.", "1..2", "1e+"] {
+            assert!(parse(invalid).is_err(), "{invalid:?} should be rejected");
+        }
     }
 }
